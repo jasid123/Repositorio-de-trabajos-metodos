@@ -1,0 +1,6 @@
+﻿Date&Time,PM10,PM2.5,NO2 ppb,O3 ppb,Temp_Aire,Lluvia,Humedad_Relativa,WD,WS,R_Solar
+Date&Time,ug/m3,ug/m3,ug/m3,ug/m3,C,mm,%,grados,m/s,W/m2
+2018-10-01 00:00:00,NoData,NoData,NoData,NoData,NoData,NoData,NoData,NoData,NoData,NoData
+2018-10-01 01:00:00,NoData,NoData,NoData,NoData,NoData,NoData,NoData,NoData,NoData,NoData
+2018-10-01 02:00:00,NoData,NoData,NoData,NoData,NoData,NoData,NoData,NoData,NoData,NoData
+2018-10-01 03:00:00,NoData,NoData,NoData,NoData,NoData,NoData,NoData,NoData,NoData,NoData

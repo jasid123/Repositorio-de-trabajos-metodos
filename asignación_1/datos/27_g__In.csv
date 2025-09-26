@@ -1,0 +1,2746 @@
+﻿g_In
+""
+"# ==============================
+# Distancia entre series suavizadas (RMSE/MAE/L2_tiempo)
+# ==============================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# --------- CONFIGURACIÓN ---------
+# Rutas por defecto en tu PC (solo se usan si df_est/df_sen no existen ya)
+BASE_EST_DIR = Path(r""C:\Users\Usuario\Downloads\asignacion_1"")
+SENSORS_DIR  = BASE_EST_DIR / ""mediciones""
+
+# Carpeta de salida
+OUT_DIR = Path.home() / ""Taller_distancias"" / ""distancias""
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Ventanas (en horas)
+WINDOW_START = 2   # inicio
+WINDOW_END   = 120 # fin
+WINDOW_STEP  = 2   # paso (4h)
+WINDOWS = [f""{h}h"" for h in range(WINDOW_START, WINDOW_END + 1, WINDOW_STEP)]
+
+# Modo de suavizado:
+#  - ""loose"": rolling por ventana de tiempo (min_periods=1) -> bordes permisivos.
+#  - ""strict"": resample 1H y rolling por N muestras (min_periods=N) -> exige ventana completa.
+SMOOTH_MODE = ""loose""   # ""loose"" o ""strict""
+
+# Métrica principal a reportar en la gráfica (además se guardan las otras)
+PRIMARY_METRIC = ""rmse""  # ""rmse"", ""mae"" o ""l2_time""
+
+
+# --------- HELPERS GENERALES ---------
+def find_column_by_keywords(columns, keywords):
+    cols_l = [str(c).lower() for c in columns]
+    for kw in keywords:
+        for i, c in enumerate(cols_l):
+            if kw.lower() in c:
+                return columns[i]
+    return None
+
+def parse_datetime_series(srs):
+    """"""Convierte robustamente a datetime (serial Excel si mayormente numérico; si no, dayfirst/False).""""""
+    s = srs.copy()
+    s_nn = s.dropna()
+    n = len(s_nn)
+    if n == 0:
+        return pd.to_datetime(s, errors=""coerce"")
+
+    # ¿Mayormente numérico? -> serial Excel
+    numeric_count = sum(isinstance(x, (int, float, np.integer, np.floating)) for x in s_nn)
+    if n > 0 and numeric_count / n > 0.75:
+        parsed_excel = pd.to_datetime(s, unit='d', origin='1899-12-30', errors='coerce')
+        if parsed_excel.notna().sum() > 0:
+            return parsed_excel
+
+    d1 = pd.to_datetime(s, dayfirst=True, errors='coerce')
+    d2 = pd.to_datetime(s, dayfirst=False, errors='coerce')
+    return d1 if d1.notna().sum() >= d2.notna().sum() else d2
+
+def safe_numeric(srs):
+    return pd.to_numeric(srs, errors='coerce')
+
+def _prep_df(df, name):
+    """"""Asegura DateTimeIndex y columna 'pm25'.""""""
+    if ""pm25"" not in df.columns:
+        if len(df.columns) == 1:
+            df = df.rename(columns={df.columns[0]: ""pm25""})
+        else:
+            raise ValueError(f""{name} no tiene columna 'pm25'."")
+    idx = pd.to_datetime(df.index, errors=""coerce"")
+    out = df.copy()
+    out.index = idx
+    out = out.dropna(subset=[""pm25""]).sort_index()
+    return out
+
+def _exists_df(name, g):
+    return (name in g) and isinstance(g[name], pd.DataFrame)
+
+# --------- CARGA DE ESTACIONES/SENSORES (si no existen) ---------
+def load_estaciones_from_dir(base_dir: Path):
+    """"""Busca un Excel de estaciones en base_dir y devuelve DF indexado por tiempo con columna pm25.""""""
+    xlsx_files = list(base_dir.glob(""*.xlsx""))
+    if not xlsx_files:
+        return None
+    # Prioriza nombres con 'estacion' o 'amb'
+    prio = [p for p in xlsx_files if (""estacion"" in p.stem.lower() or ""amb"" in p.stem.lower())]
+    ref_file = prio[0] if prio else xlsx_files[0]
+
+    try:
+        df = pd.read_excel(ref_file, header=[0,1], engine=""openpyxl"")
+        # Aplana si MultiIndex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [""_"".join([str(x) for x in tup if str(x) != ""nan"" and str(x).strip() != """"]).strip() or ""unnamed""
+                          for tup in df.columns]
+    except Exception:
+        df = pd.read_excel(ref_file, header=0, engine=""openpyxl"")
+
+    # Detectar columnas
+    time_col = find_column_by_keywords(df.columns, ['date&time', 'date', 'time', 'fecha', 'hora']) or df.columns[0]
+    pm_col   = (find_column_by_keywords(df.columns, ['pm2.5', 'pm 2.5', 'pm25', 'pm'])
+                or (df.columns[1] if len(df.columns) > 1 else df.columns[0]))
+
+    t = parse_datetime_series(df[time_col])
+    v = safe_numeric(df[pm_col])
+    out = pd.DataFrame({""pm25"": v}, index=t).dropna().sort_index()
+    return out
+
+def load_sensores_from_dir(sensors_dir: Path):
+    """"""Concatena todos los CSV de sensors_dir, detectando columnas tiempo/pm y promediando duplicados.""""""
+    import glob
+    csv_files = sorted(glob.glob(str(sensors_dir / ""*.csv"")))
+    if not csv_files:
+        return None
+
+    frames = []
+    for path in csv_files:
+        try:
+            d = pd.read_csv(path)
+        except Exception:
+            try:
+                d = pd.read_csv(path, sep="";"", encoding=""latin-1"")
+            except Exception:
+                continue
+
+        d.columns = [str(c).strip() for c in d.columns]
+        tcol = find_column_by_keywords(d.columns, ['date&time', 'date', 'time', 'fecha', 'hora']) or d.columns[0]
+        pcol = (find_column_by_keywords(d.columns, ['pm2.5', 'pm 2.5', 'pm25', 'pm'])
+                or (d.columns[1] if len(d.columns) > 1 else d.columns[0]))
+        tmp = pd.DataFrame({
+            ""tiempo"": parse_datetime_series(d[tcol]),
+            ""pm25"": safe_numeric(d[pcol])
+        }).dropna().sort_values(""tiempo"")
+        frames.append(tmp)
+
+    if not frames:
+        return None
+
+    df = pd.concat(frames, ignore_index=True)
+    df = df.set_index(""tiempo"").sort_index()
+    # Si hay múltiples sensores en el mismo instante, promedia
+    df = df.groupby(df.index).mean()
+    return df
+
+# Si no existen df_est / df_sen, intenta cargarlos desde las rutas por defecto
+g = globals()
+if not _exists_df(""df_est"", g) or not _exists_df(""df_sen"", g):
+    _est = load_estaciones_from_dir(BASE_EST_DIR)
+    _sen = load_sensores_from_dir(SENSORS_DIR)
+    if _est is None or _sen is None:
+        raise RuntimeError(""No encuentro df_est/df_sen ni pude cargar desde las rutas por defecto. Ajusta BASE_EST_DIR y SENSORS_DIR."")
+    df_est, df_sen = _prep_df(_est, ""df_est""), _prep_df(_sen, ""df_sen"")
+else:
+    df_est, df_sen = _prep_df(df_est, ""df_est""), _prep_df(df_sen, ""df_sen"")
+
+print(""[EST] n:"", len(df_est), ""rango:"", df_est.index.min(), ""→"", df_est.index.max())
+print(""[SEN] n:"", len(df_sen), ""rango:"", df_sen.index.min(), ""→"", df_sen.index.max())
+
+# --------- ALINEACIÓN POR CERCANÍA ---------
+def _to_naive_utc_index(s: pd.Series) -> pd.Series:
+    s = s.dropna().copy()
+    idx = pd.to_datetime(s.index, errors=""coerce"")
+    if getattr(idx, ""tz"", None) is not None:
+        idx = idx.tz_convert(""UTC"").tz_localize(None)
+    s.index = idx
+    return s.sort_index()
+
+def _delta_tipico(s: pd.Series) -> pd.Timedelta:
+    idx = s.index
+    if len(idx) < 2:
+        return pd.Timedelta(0)
+    return pd.Series(idx).diff().median()
+
+def alinear_por_cercania(ref: pd.Series, sen: pd.Series, window_str: str) -> pd.DataFrame:
+    """"""Empareja por tiempo más cercano con tolerancia estricta.""""""
+    ref_n = _to_naive_utc_index(ref)
+    sen_n = _to_naive_utc_index(sen)
+    w = pd.to_timedelta(window_str)
+
+    d_ref, d_sen = _delta_tipico(ref_n), _delta_tipico(sen_n)
+    # Tolerancia más conservadora
+    if d_ref > pd.Timedelta(0) and d_sen > pd.Timedelta(0):
+        base = min(d_ref, d_sen)
+    else:
+        base = w / 8
+    tol = min(base * 0.5, w / 8)
+
+    A = ref_n.rename(""ref"").reset_index().rename(columns={""index"": ""fecha""})
+    B = sen_n.rename(""sen"").reset_index().rename(columns={""index"": ""fecha""})
+    A[""fecha""] = pd.to_datetime(A[""fecha""], utc=False)
+    B[""fecha""] = pd.to_datetime(B[""fecha""], utc=False)
+    df = pd.merge_asof(A.sort_values(""fecha""), B.sort_values(""fecha""),
+                       on=""fecha"", direction=""nearest"", tolerance=tol)
+    return df.dropna(subset=[""ref"", ""sen""]).set_index(""fecha"").sort_index()
+
+# --------- MÉTRICAS DE DISTANCIA ---------
+def distancia_metricas(df_al: pd.DataFrame, metric=""rmse""):
+    """"""RMSE/MAE/L2 sobre puntos emparejados (no ponderado).""""""
+    if df_al.empty:
+        return np.nan
+    d = (df_al[""ref""] - df_al[""sen""]).to_numpy()
+    if metric == ""rmse"":
+        return float(np.sqrt(np.mean(d**2)))
+    elif metric == ""mae"":
+        return float(np.mean(np.abs(d)))
+    elif metric == ""l2"":
+        return float(np.sqrt(np.sum(d**2)))
+    else:
+        raise ValueError(""metric debe ser 'rmse', 'mae' o 'l2'."")
+
+def distancia_l2_timeweighted(df_al: pd.DataFrame) -> float:
+    """"""Aproxima ||ref - sen||_L2 = sqrt(∫ (r-s)^2 dt) por trapecios en tiempo.""""""
+    if len(df_al) < 2:
+        return np.nan
+    d2 = (df_al[""ref""] - df_al[""sen""]).to_numpy()**2
+    t = df_al.index.view(""int64"") / 1e9  # segundos
+    dt = np.diff(t)
+    mid = 0.5 * (d2[:-1] + d2[1:])
+    integral = np.sum(mid * dt)  # (valor^2)*s
+    return float(np.sqrt(integral))
+
+# --------- SUAVIZADO (rolling) ---------
+def compute_ma(series, win_str, mode):
+    if mode == ""loose"":
+        win = pd.Timedelta(win_str)                  # acepta '6h', '12h', etc.
+        return series.rolling(win, min_periods=1).mean()
+    elif mode == ""strict"":
+        s_reg = series.resample(""1h"").mean()         # minúscula
+        N = int(pd.Timedelta(win_str) / pd.Timedelta(""1h""))
+        return s_reg.rolling(N, min_periods=N).mean()
+
+
+# --------- CÁLCULO DE DISTANCIAS ---------
+rows = []
+for w in WINDOWS:
+    est_ma = compute_ma(df_est[""pm25""], w, SMOOTH_MODE)
+    sen_ma = compute_ma(df_sen[""pm25""], w, SMOOTH_MODE)
+
+    df_al = alinear_por_cercania(est_ma, sen_ma, w)
+    pares = len(df_al)
+
+    D_rmse   = distancia_metricas(df_al, ""rmse"")
+    D_mae    = distancia_metricas(df_al, ""mae"")
+    D_l2     = distancia_metricas(df_al, ""l2"")
+    D_l2time = distancia_l2_timeweighted(df_al)
+
+    rows.append({
+        ""ventana"": w,
+        ""pares"": pares,
+        ""rmse"": D_rmse,
+        ""mae"": D_mae,
+        ""l2"": D_l2,
+        ""l2_time"": D_l2time
+    })
+
+df_dist = pd.DataFrame(rows)
+df_dist[""horas""] = df_dist[""ventana""].str.replace(""h"", """", case=False).astype(int)
+df_dist = df_dist.sort_values(""horas"").reset_index(drop=True)
+
+# --------- RESÚMENES ---------
+print(""\nResumen (primeras filas):"")
+print(df_dist.head(10).to_string(index=False))
+
+validas = df_dist[df_dist[""pares""] > 0].copy()
+
+def best_row(metric):
+    vv = validas.dropna(subset=[metric])
+    return vv.loc[vv[metric].idxmin()] if not vv.empty else None
+
+best_rmse   = best_row(""rmse"")
+best_mae    = best_row(""mae"")
+best_l2time = best_row(""l2_time"")
+
+if best_rmse is not None:
+    print(f""\n[MEJOR RMSE] ventana={best_rmse['ventana']} | horas={int(best_rmse['horas'])} ""
+          f""| pares={int(best_rmse['pares'])} | RMSE={best_rmse['rmse']:.6f}"")
+if best_mae is not None:
+    print(f""[MEJOR MAE ] ventana={best_mae['ventana']} | horas={int(best_mae['horas'])} ""
+          f""| pares={int(best_mae['pares'])} | MAE={best_mae['mae']:.6f}"")
+if best_l2time is not None:
+    print(f""[MEJOR L2_t] ventana={best_l2time['ventana']} | horas={int(best_l2time['horas'])} ""
+          f""| pares={int(best_l2time['pares'])} | L2_t={best_l2time['l2_time']:.6f}"")
+
+# --------- GUARDAR CSV ---------
+csv_path = OUT_DIR / f""distancias_{SMOOTH_MODE}_{WINDOW_START}-{WINDOW_END}h_step{WINDOW_STEP}.csv""
+df_dist.to_csv(csv_path, index=False)
+print(f""\n[OK] Resultados guardados en: {csv_path}"")
+
+# --------- GRÁFICA (métrica primaria) ---------
+y = df_dist[PRIMARY_METRIC]
+plt.figure(figsize=(9,5))
+plt.plot(df_dist[""horas""], y, marker=""o"")
+plt.title(f""RMSE vs tamaño de ventana"")
+plt.xlabel(""Tamaño de ventana (horas)"")
+plt.ylabel(PRIMARY_METRIC.upper())
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+png_path = OUT_DIR / f""distancia_{PRIMARY_METRIC}_{SMOOTH_MODE}.png""
+plt.savefig(png_path, dpi=300)
+plt.show()
+print(f""[OK] Gráfica guardada en: {png_path}"")"
+"import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ---------- utilidades mínimas (si ya las tienes, puedes omitirlas) ----------
+def compute_ma(series: pd.Series, win_str: str | None = ""24h"", mode: str = ""loose""):
+    """"""Promedio móvil: 'loose' (rolling por tiempo, bordes permisivos) o 'strict' (resample 1h + ventana completa).""""""
+    series = series.sort_index()
+    if win_str is None:
+        return series
+    if mode == ""loose"":
+        win = pd.Timedelta(win_str)            # evita warnings de 'H'
+        return series.rolling(win, min_periods=1).mean()
+    elif mode == ""strict"":
+        s_reg = series.resample(""1h"").mean()   # rejilla horaria
+        N = max(int(pd.Timedelta(win_str)/pd.Timedelta(""1h"")), 1)
+        return s_reg.rolling(N, min_periods=N).mean()
+    else:
+        raise ValueError(""mode debe ser 'loose' o 'strict'"")
+
+def alinear_por_cercania_flexible(ref: pd.Series, sen: pd.Series, window_str: str,
+                                  factors=(0.5, 1.0, 2.0, 4.0), min_tol=""5min""):
+    """"""Empareja ref-sen por tiempo con tolerancia creciente hasta lograr pares.""""""
+    def _to_naive_utc_index(s: pd.Series) -> pd.Series:
+        s = s.dropna().copy()
+        idx = pd.to_datetime(s.index, errors=""coerce"")
+        if getattr(idx, ""tz"", None) is not None:
+            idx = idx.tz_convert(""UTC"").tz_localize(None)
+        s.index = idx
+        return s.sort_index()
+    def _delta_tipico(s: pd.Series) -> pd.Timedelta:
+        idx = s.index
+        if len(idx) < 2: return pd.Timedelta(0)
+        return pd.Series(idx).diff().median()
+
+    ref_n = _to_naive_utc_index(ref)
+    sen_n = _to_naive_utc_index(sen)
+    w = pd.to_timedelta(window_str)
+    d_ref, d_sen = _delta_tipico(ref_n), _delta_tipico(sen_n)
+    base = (min(d_ref, d_sen) if (d_ref > pd.Timedelta(0) and d_sen > pd.Timedelta(0))
+            else pd.to_timedelta(min_tol))
+
+    A = ref_n.rename(""ref"").reset_index().rename(columns={""index"": ""fecha""})
+    B = sen_n.rename(""sen"").reset_index().rename(columns={""index"": ""fecha""})
+    A[""fecha""] = pd.to_datetime(A[""fecha""], utc=False)
+    B[""fecha""] = pd.to_datetime(B[""fecha""], utc=False)
+
+    for f in factors:
+        tol = min(base * f, w/4)  # no exceder una fracción de la ventana
+        df = pd.merge_asof(A.sort_values(""fecha""), B.sort_values(""fecha""),
+                           on=""fecha"", direction=""nearest"", tolerance=tol)
+        df = df.dropna(subset=[""ref"",""sen""]).set_index(""fecha"").sort_index()
+        if not df.empty:
+            print(f""[alinear] OK tolerancia={tol} (pares={len(df)})"")
+            return df
+        else:
+            print(f""[alinear] sin pares con tolerancia={tol}, probando mayor…"")
+    return pd.DataFrame(columns=[""ref"",""sen""])
+
+# ---------- función principal: grafica todo y marca fuera de tolerancia ----------
+def graficar_y_outliers(
+    win_str=""24h"",          # ventana de suavizado ('6h','12h','24h', None para sin suavizar)
+    mode=""loose"",           # 'loose' o 'strict'
+    abs_tol=5.0,            # tolerancia absoluta en µg/m³ (None para ignorar)
+    rel_tol=None,           # tolerancia relativa (p.ej. 0.2 = 20%; None para ignorar)
+    sigma_ref=None,         # incertidumbre de la referencia (escalares o arrays), en µg/m³
+    sigma_sen=None,         # incertidumbre del sensor (escalares o arrays), en µg/m³
+    k_sigma=2.0,            # multiplicador k·σ (p.ej. 2 sigma)
+    out_dir=None,           # carpeta de salida
+    mostrar_top=15          # imprime los primeros N outliers
+):
+    # --- checks básicos ---
+    if ""df_est"" not in globals() or ""df_sen"" not in globals():
+        raise RuntimeError(""Necesito df_est y df_sen en el entorno (Índice datetime, columna 'pm25')."")
+
+    # 1) Suavizar
+    est_ma = compute_ma(df_est[""pm25""], win_str, mode)
+    sen_ma = compute_ma(df_sen[""pm25""], win_str, mode)
+
+    # 2) Alinear por tiempo (flex)
+    w_align = win_str or ""1h""
+    df_al = alinear_por_cercania_flexible(est_ma, sen_ma, w_align)
+    if df_al.empty:
+        print(""[AVISO] No se lograron pares alineados."")
+        return
+
+    # 3) Errores y tolerancia
+    df_al = df_al.copy()
+    df_al[""error""] = df_al[""sen""] - df_al[""ref""]
+    df_al[""abs_error""] = df_al[""error""].abs()
+
+    # tolerancia por punto (tomamos el MÁXIMO entre aportes disponibles)
+    tol_arr = np.zeros(len(df_al), dtype=float)
+
+    # (a) absoluta
+    if abs_tol is not None:
+        tol_arr = np.maximum(tol_arr, float(abs_tol))
+
+    # (b) relativa (fracción de la referencia)
+    if rel_tol is not None:
+        tol_arr = np.maximum(tol_arr, float(rel_tol) * np.abs(df_al[""ref""].to_numpy()))
+
+    # (c) por incertidumbres (RSS): k * sqrt(σ_y^2 + σ_x^2)
+    if (sigma_ref is not None) or (sigma_sen is not None):
+        if np.isscalar(sigma_ref) or sigma_ref is None:
+            sx = np.full(len(df_al), 0.0 if sigma_ref is None else float(sigma_ref))
+        else:
+            sx = np.asarray(sigma_ref, float)
+            if sx.size != len(df_al):
+                sx = np.full(len(df_al), np.median(sx))  # fallback
+        if np.isscalar(sigma_sen) or sigma_sen is None:
+            sy = np.full(len(df_al), 0.0 if sigma_sen is None else float(sigma_sen))
+        else:
+            sy = np.asarray(sigma_sen, float)
+            if sy.size != len(df_al):
+                sy = np.full(len(df_al), np.median(sy))  # fallback
+
+        tol_sigma = float(k_sigma) * np.sqrt(sx**2 + sy**2)
+        tol_arr = np.maximum(tol_arr, tol_sigma)
+
+    df_al[""tol""] = tol_arr
+    df_al[""rel_error""] = df_al[""abs_error""] / np.maximum(np.abs(df_al[""ref""]), 1e-9)
+    df_al[""fuera_tol""] = df_al[""abs_error""] > df_al[""tol""]
+
+    n_tot = len(df_al)
+    n_out = int(df_al[""fuera_tol""].sum())
+    print(f""[RESUMEN] pares={n_tot} | fuera_tolerancia={n_out} ({n_out*100.0/n_tot:.2f}%)"")
+
+    # 4) Gráfica
+    plt.figure(figsize=(9,6))
+    # dentro de tolerancia
+    dentro = df_al[~df_al[""fuera_tol""]]
+    plt.scatter(dentro[""ref""], dentro[""sen""], s=7, alpha=0.25, label=f""En tolerancia (n={len(dentro)})"")
+    # fuera de tolerancia
+    fuera = df_al[df_al[""fuera_tol""]]
+    if not fuera.empty:
+        plt.scatter(fuera[""ref""], fuera[""sen""], s=18, alpha=0.9, label=f""Fuera de tolerancia (n={len(fuera)})"", color=""red"")
+
+    # y = x
+    x_min = float(np.nanmin(df_al[""ref""]))
+    x_max = float(np.nanmax(df_al[""ref""]))
+    xs = np.linspace(x_min, x_max, 200)
+    plt.plot(xs, xs, ""--"", lw=1, label=""y = x (ideal)"")
+
+    # banda de tolerancia si es CONSTANTE (misma tol para todos los puntos)
+    if np.isfinite(tol_arr).all() and np.ptp(tol_arr) < 1e-9 and tol_arr[0] > 0:
+        band = tol_arr[0]
+        plt.plot(xs, xs + band, "":"", lw=1, label=f""+{band:.2f} µg/m³"")
+        plt.plot(xs, xs - band, "":"", lw=1, label=f""-{band:.2f} µg/m³"")
+
+    # banda relativa (si está configurada y sin incertidumbres variables)
+    if (rel_tol is not None) and (sigma_ref is None) and (sigma_sen is None) and (abs_tol is None):
+        # y = (1 ± r) x
+        r = float(rel_tol)
+        plt.plot(xs, (1+r)*xs, "":"", lw=1, label=f""+{int(r*100)}%"")
+        plt.plot(xs, (1-r)*xs, "":"", lw=1, label=f""-{int(r*100)}%"")
+
+    titulo = ""Sensor vs Referencia — puntos y fuera de tolerancia""
+    if win_str: titulo += f"" — MA {win_str}""
+    plt.title(titulo)
+    plt.xlabel(""Medición (referencia)"")
+    plt.ylabel(""Sensor"")
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc=""best"")
+    plt.tight_layout()
+
+    # 5) Guardar
+    out_dir = Path.home() / ""Taller_distancias"" / ""outliers"" if out_dir is None else Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tag = f""MA_{win_str or 'sinMA'}""
+    png_path = out_dir / f""sensor_vs_ref_outliers_{tag}.png""
+    csv_path = out_dir / f""outliers_{tag}.csv""
+
+    plt.savefig(png_path, dpi=300)
+    try:
+        plt.show()
+    except Exception:
+        pass
+
+    # Guardar CSV solo con fuera de tolerancia (y también todo si quieres)
+    fuera_sorted = fuera.copy()
+    fuera_sorted = fuera_sorted.sort_index()
+    fuera_sorted.to_csv(csv_path, index=True)
+    print(f""[OK] PNG: {png_path}"")
+    print(f""[OK] CSV fuera de tolerancia: {csv_path}"")
+
+    # Mostrar una muestra por consola
+    if n_out > 0 and mostrar_top:
+        print(""\nEjemplos fuera de tolerancia:"")
+        print(fuera_sorted[[""ref"",""sen"",""error"",""abs_error"",""tol"",""rel_error""]].head(mostrar_top).to_string())"
+"# ==============================
+# Distancia entre series suavizadas (RMSE/MAE/L2_tiempo)
+# ==============================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# --------- CONFIGURACIÓN ---------
+# Rutas por defecto en tu PC (solo se usan si df_est/df_sen no existen ya)
+BASE_EST_DIR = Path(r""C:\Users\Usuario\Downloads\asignacion_1"")
+SENSORS_DIR  = BASE_EST_DIR / ""mediciones""
+
+# Carpeta de salida
+OUT_DIR = Path.home() / ""Taller_distancias"" / ""distancias""
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Ventanas (en horas)
+WINDOW_START = 2   # inicio
+WINDOW_END   = 120 # fin
+WINDOW_STEP  = 2   # paso (4h)
+WINDOWS = [f""{h}h"" for h in range(WINDOW_START, WINDOW_END + 1, WINDOW_STEP)]
+
+# Modo de suavizado:
+#  - ""loose"": rolling por ventana de tiempo (min_periods=1) -> bordes permisivos.
+#  - ""strict"": resample 1H y rolling por N muestras (min_periods=N) -> exige ventana completa.
+SMOOTH_MODE = ""loose""   # ""loose"" o ""strict""
+
+# Métrica principal a reportar en la gráfica (además se guardan las otras)
+PRIMARY_METRIC = ""rmse""  # ""rmse"", ""mae"" o ""l2_time""
+
+
+# --------- HELPERS GENERALES ---------
+def find_column_by_keywords(columns, keywords):
+    cols_l = [str(c).lower() for c in columns]
+    for kw in keywords:
+        for i, c in enumerate(cols_l):
+            if kw.lower() in c:
+                return columns[i]
+    return None
+
+def parse_datetime_series(srs):
+    """"""Convierte robustamente a datetime (serial Excel si mayormente numérico; si no, dayfirst/False).""""""
+    s = srs.copy()
+    s_nn = s.dropna()
+    n = len(s_nn)
+    if n == 0:
+        return pd.to_datetime(s, errors=""coerce"")
+
+    # ¿Mayormente numérico? -> serial Excel
+    numeric_count = sum(isinstance(x, (int, float, np.integer, np.floating)) for x in s_nn)
+    if n > 0 and numeric_count / n > 0.75:
+        parsed_excel = pd.to_datetime(s, unit='d', origin='1899-12-30', errors='coerce')
+        if parsed_excel.notna().sum() > 0:
+            return parsed_excel
+
+    d1 = pd.to_datetime(s, dayfirst=True, errors='coerce')
+    d2 = pd.to_datetime(s, dayfirst=False, errors='coerce')
+    return d1 if d1.notna().sum() >= d2.notna().sum() else d2
+
+def safe_numeric(srs):
+    return pd.to_numeric(srs, errors='coerce')
+
+def _prep_df(df, name):
+    """"""Asegura DateTimeIndex y columna 'pm25'.""""""
+    if ""pm25"" not in df.columns:
+        if len(df.columns) == 1:
+            df = df.rename(columns={df.columns[0]: ""pm25""})
+        else:
+            raise ValueError(f""{name} no tiene columna 'pm25'."")
+    idx = pd.to_datetime(df.index, errors=""coerce"")
+    out = df.copy()
+    out.index = idx
+    out = out.dropna(subset=[""pm25""]).sort_index()
+    return out
+
+def _exists_df(name, g):
+    return (name in g) and isinstance(g[name], pd.DataFrame)
+
+# --------- CARGA DE ESTACIONES/SENSORES (si no existen) ---------
+def load_estaciones_from_dir(base_dir: Path):
+    """"""Busca un Excel de estaciones en base_dir y devuelve DF indexado por tiempo con columna pm25.""""""
+    xlsx_files = list(base_dir.glob(""*.xlsx""))
+    if not xlsx_files:
+        return None
+    # Prioriza nombres con 'estacion' o 'amb'
+    prio = [p for p in xlsx_files if (""estacion"" in p.stem.lower() or ""amb"" in p.stem.lower())]
+    ref_file = prio[0] if prio else xlsx_files[0]
+
+    try:
+        df = pd.read_excel(ref_file, header=[0,1], engine=""openpyxl"")
+        # Aplana si MultiIndex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [""_"".join([str(x) for x in tup if str(x) != ""nan"" and str(x).strip() != """"]).strip() or ""unnamed""
+                          for tup in df.columns]
+    except Exception:
+        df = pd.read_excel(ref_file, header=0, engine=""openpyxl"")
+
+    # Detectar columnas
+    time_col = find_column_by_keywords(df.columns, ['date&time', 'date', 'time', 'fecha', 'hora']) or df.columns[0]
+    pm_col   = (find_column_by_keywords(df.columns, ['pm2.5', 'pm 2.5', 'pm25', 'pm'])
+                or (df.columns[1] if len(df.columns) > 1 else df.columns[0]))
+
+    t = parse_datetime_series(df[time_col])
+    v = safe_numeric(df[pm_col])
+    out = pd.DataFrame({""pm25"": v}, index=t).dropna().sort_index()
+    return out
+
+def load_sensores_from_dir(sensors_dir: Path):
+    """"""Concatena todos los CSV de sensors_dir, detectando columnas tiempo/pm y promediando duplicados.""""""
+    import glob
+    csv_files = sorted(glob.glob(str(sensors_dir / ""*.csv"")))
+    if not csv_files:
+        return None
+
+    frames = []
+    for path in csv_files:
+        try:
+            d = pd.read_csv(path)
+        except Exception:
+            try:
+                d = pd.read_csv(path, sep="";"", encoding=""latin-1"")
+            except Exception:
+                continue
+
+        d.columns = [str(c).strip() for c in d.columns]
+        tcol = find_column_by_keywords(d.columns, ['date&time', 'date', 'time', 'fecha', 'hora']) or d.columns[0]
+        pcol = (find_column_by_keywords(d.columns, ['pm2.5', 'pm 2.5', 'pm25', 'pm'])
+                or (d.columns[1] if len(d.columns) > 1 else d.columns[0]))
+        tmp = pd.DataFrame({
+            ""tiempo"": parse_datetime_series(d[tcol]),
+            ""pm25"": safe_numeric(d[pcol])
+        }).dropna().sort_values(""tiempo"")
+        frames.append(tmp)
+
+    if not frames:
+        return None
+
+    df = pd.concat(frames, ignore_index=True)
+    df = df.set_index(""tiempo"").sort_index()
+    # Si hay múltiples sensores en el mismo instante, promedia
+    df = df.groupby(df.index).mean()
+    return df
+
+# Si no existen df_est / df_sen, intenta cargarlos desde las rutas por defecto
+g = globals()
+if not _exists_df(""df_est"", g) or not _exists_df(""df_sen"", g):
+    _est = load_estaciones_from_dir(BASE_EST_DIR)
+    _sen = load_sensores_from_dir(SENSORS_DIR)
+    if _est is None or _sen is None:
+        raise RuntimeError(""No encuentro df_est/df_sen ni pude cargar desde las rutas por defecto. Ajusta BASE_EST_DIR y SENSORS_DIR."")
+    df_est, df_sen = _prep_df(_est, ""df_est""), _prep_df(_sen, ""df_sen"")
+else:
+    df_est, df_sen = _prep_df(df_est, ""df_est""), _prep_df(df_sen, ""df_sen"")
+
+print(""[EST] n:"", len(df_est), ""rango:"", df_est.index.min(), ""→"", df_est.index.max())
+print(""[SEN] n:"", len(df_sen), ""rango:"", df_sen.index.min(), ""→"", df_sen.index.max())
+
+# --------- ALINEACIÓN POR CERCANÍA ---------
+def _to_naive_utc_index(s: pd.Series) -> pd.Series:
+    s = s.dropna().copy()
+    idx = pd.to_datetime(s.index, errors=""coerce"")
+    if getattr(idx, ""tz"", None) is not None:
+        idx = idx.tz_convert(""UTC"").tz_localize(None)
+    s.index = idx
+    return s.sort_index()
+
+def _delta_tipico(s: pd.Series) -> pd.Timedelta:
+    idx = s.index
+    if len(idx) < 2:
+        return pd.Timedelta(0)
+    return pd.Series(idx).diff().median()
+
+def alinear_por_cercania(ref: pd.Series, sen: pd.Series, window_str: str) -> pd.DataFrame:
+    """"""Empareja por tiempo más cercano con tolerancia estricta.""""""
+    ref_n = _to_naive_utc_index(ref)
+    sen_n = _to_naive_utc_index(sen)
+    w = pd.to_timedelta(window_str)
+
+    d_ref, d_sen = _delta_tipico(ref_n), _delta_tipico(sen_n)
+    # Tolerancia más conservadora
+    if d_ref > pd.Timedelta(0) and d_sen > pd.Timedelta(0):
+        base = min(d_ref, d_sen)
+    else:
+        base = w / 8
+    tol = min(base * 0.5, w / 8)
+
+    A = ref_n.rename(""ref"").reset_index().rename(columns={""index"": ""fecha""})
+    B = sen_n.rename(""sen"").reset_index().rename(columns={""index"": ""fecha""})
+    A[""fecha""] = pd.to_datetime(A[""fecha""], utc=False)
+    B[""fecha""] = pd.to_datetime(B[""fecha""], utc=False)
+    df = pd.merge_asof(A.sort_values(""fecha""), B.sort_values(""fecha""),
+                       on=""fecha"", direction=""nearest"", tolerance=tol)
+    return df.dropna(subset=[""ref"", ""sen""]).set_index(""fecha"").sort_index()
+
+# --------- MÉTRICAS DE DISTANCIA ---------
+def distancia_metricas(df_al: pd.DataFrame, metric=""rmse""):
+    """"""RMSE/MAE/L2 sobre puntos emparejados (no ponderado).""""""
+    if df_al.empty:
+        return np.nan
+    d = (df_al[""ref""] - df_al[""sen""]).to_numpy()
+    if metric == ""rmse"":
+        return float(np.sqrt(np.mean(d**2)))
+    elif metric == ""mae"":
+        return float(np.mean(np.abs(d)))
+    elif metric == ""l2"":
+        return float(np.sqrt(np.sum(d**2)))
+    else:
+        raise ValueError(""metric debe ser 'rmse', 'mae' o 'l2'."")
+
+def distancia_l2_timeweighted(df_al: pd.DataFrame) -> float:
+    """"""Aproxima ||ref - sen||_L2 = sqrt(∫ (r-s)^2 dt) por trapecios en tiempo.""""""
+    if len(df_al) < 2:
+        return np.nan
+    d2 = (df_al[""ref""] - df_al[""sen""]).to_numpy()**2
+    t = df_al.index.view(""int64"") / 1e9  # segundos
+    dt = np.diff(t)
+    mid = 0.5 * (d2[:-1] + d2[1:])
+    integral = np.sum(mid * dt)  # (valor^2)*s
+    return float(np.sqrt(integral))
+
+# --------- SUAVIZADO (rolling) ---------
+def compute_ma(series, win_str, mode):
+    if mode == ""loose"":
+        win = pd.Timedelta(win_str)                  # acepta '6h', '12h', etc.
+        return series.rolling(win, min_periods=1).mean()
+    elif mode == ""strict"":
+        s_reg = series.resample(""1h"").mean()         # minúscula
+        N = int(pd.Timedelta(win_str) / pd.Timedelta(""1h""))
+        return s_reg.rolling(N, min_periods=N).mean()
+
+
+# --------- CÁLCULO DE DISTANCIAS ---------
+rows = []
+for w in WINDOWS:
+    est_ma = compute_ma(df_est[""pm25""], w, SMOOTH_MODE)
+    sen_ma = compute_ma(df_sen[""pm25""], w, SMOOTH_MODE)
+
+    df_al = alinear_por_cercania(est_ma, sen_ma, w)
+    pares = len(df_al)
+
+    D_rmse   = distancia_metricas(df_al, ""rmse"")
+    D_mae    = distancia_metricas(df_al, ""mae"")
+    D_l2     = distancia_metricas(df_al, ""l2"")
+    D_l2time = distancia_l2_timeweighted(df_al)
+
+    rows.append({
+        ""ventana"": w,
+        ""pares"": pares,
+        ""rmse"": D_rmse,
+        ""mae"": D_mae,
+        ""l2"": D_l2,
+        ""l2_time"": D_l2time
+    })
+
+df_dist = pd.DataFrame(rows)
+df_dist[""horas""] = df_dist[""ventana""].str.replace(""h"", """", case=False).astype(int)
+df_dist = df_dist.sort_values(""horas"").reset_index(drop=True)
+
+# --------- RESÚMENES ---------
+print(""\nResumen (primeras filas):"")
+print(df_dist.head(10).to_string(index=False))
+
+validas = df_dist[df_dist[""pares""] > 0].copy()
+
+def best_row(metric):
+    vv = validas.dropna(subset=[metric])
+    return vv.loc[vv[metric].idxmin()] if not vv.empty else None
+
+best_rmse   = best_row(""rmse"")
+best_mae    = best_row(""mae"")
+best_l2time = best_row(""l2_time"")
+
+if best_rmse is not None:
+    print(f""\n[MEJOR RMSE] ventana={best_rmse['ventana']} | horas={int(best_rmse['horas'])} ""
+          f""| pares={int(best_rmse['pares'])} | RMSE={best_rmse['rmse']:.6f}"")
+if best_mae is not None:
+    print(f""[MEJOR MAE ] ventana={best_mae['ventana']} | horas={int(best_mae['horas'])} ""
+          f""| pares={int(best_mae['pares'])} | MAE={best_mae['mae']:.6f}"")
+if best_l2time is not None:
+    print(f""[MEJOR L2_t] ventana={best_l2time['ventana']} | horas={int(best_l2time['horas'])} ""
+          f""| pares={int(best_l2time['pares'])} | L2_t={best_l2time['l2_time']:.6f}"")
+
+# --------- GUARDAR CSV ---------
+csv_path = OUT_DIR / f""distancias_{SMOOTH_MODE}_{WINDOW_START}-{WINDOW_END}h_step{WINDOW_STEP}.csv""
+df_dist.to_csv(csv_path, index=False)
+print(f""\n[OK] Resultados guardados en: {csv_path}"")
+
+# --------- GRÁFICA (métrica primaria) ---------
+y = df_dist[PRIMARY_METRIC]
+plt.figure(figsize=(9,5))
+plt.plot(df_dist[""horas""], y, marker=""o"")
+plt.title(f""Distancia ({PRIMARY_METRIC.upper()}) vs tamaño de ventana — modo={SMOOTH_MODE}"")
+plt.xlabel(""Tamaño de ventana (horas)"")
+plt.ylabel(PRIMARY_METRIC.upper())
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+png_path = OUT_DIR / f""distancia_{PRIMARY_METRIC}_{SMOOTH_MODE}.png""
+plt.savefig(png_path, dpi=300)
+plt.show()
+print(f""[OK] Gráfica guardada en: {png_path}"")"
+"import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path"
+"# Rutas de los archivos cargados
+file_estaciones = r""C:\Users\Usuario\Downloads\taller mediciones\Datos_Estaciones_AMB.xlsx""
+file_sensores   = r""C:\Users\Usuario\Downloads\taller mediciones\Sensor.xlsx""
+
+# Cargar los datos
+df_est = pd.read_excel(file_estaciones)
+df_sen = pd.read_excel(file_sensores)
+
+# Revisar las primeras filas para confirmar estructura
+df_est_head = df_est.head()
+df_sen_head = df_sen.head()
+
+df_est_head, df_sen_head  # Limpiar y seleccionar las columnas requeridas
+
+# --- Datos estaciones ---
+df_est_clean = df_est.iloc[1:].copy()  # saltar fila de unidades
+df_est_clean = df_est_clean.rename(columns={""Date&Time"": ""fecha"", ""PM2.5"": ""pm25""})
+df_est_clean = df_est_clean[[""fecha"", ""pm25""]]
+df_est_clean = df_est_clean[df_est_clean[""pm25""] != ""NoData""]
+df_est_clean[""fecha""] = pd.to_datetime(df_est_clean[""fecha""], errors=""coerce"")
+df_est_clean[""pm25""] = pd.to_numeric(df_est_clean[""pm25""], errors=""coerce"")
+df_est_clean = df_est_clean.dropna()
+
+# --- Datos sensores ---
+df_sen_clean = df_sen.rename(columns={""time"": ""fecha"", ""pm25"": ""pm25""})
+df_sen_clean = df_sen_clean[[""fecha"", ""pm25""]]
+df_sen_clean[""fecha""] = pd.to_datetime(df_sen_clean[""fecha""], errors=""coerce"")
+df_sen_clean[""pm25""] = pd.to_numeric(df_sen_clean[""pm25""], errors=""coerce"")
+df_sen_clean = df_sen_clean.dropna()
+df_est = pd.read_excel(file_estaciones)
+df_est = df_est.rename(columns={""Date&Time"": ""fecha"", ""PM2.5"": ""pm25""})
+df_est = df_est.iloc[1:, :]  # quitar fila de unidades
+df_est = df_est[df_est[""pm25""] != ""NoData""][[""fecha"", ""pm25""]].copy()
+df_est[""fecha""] = pd.to_datetime(df_est[""fecha""], errors=""coerce"")
+df_est[""pm25""] = pd.to_numeric(df_est[""pm25""], errors=""coerce"")
+df_est = df_est.dropna().sort_values(""fecha"").set_index(""fecha"")
+
+df_sen = pd.read_excel(file_sensores)
+df_sen = df_sen.rename(columns={""time"": ""fecha"", ""pm25"": ""pm25""})[[""fecha"", ""pm25""]].copy()
+df_sen[""fecha""] = pd.to_datetime(df_sen[""fecha""], errors=""coerce"")
+df_sen[""pm25""] = pd.to_numeric(df_sen[""pm25""], errors=""coerce"")
+df_sen = df_sen.dropna().sort_values(""fecha"").set_index(""fecha"")
+
+windows = [f""{w}h"" for w in range(2, 120,2)]
+out_dir = Path(""/home/hincachimbo/Taller_distancias/moviles_pm25"")
+out_dir.mkdir(parents=True, exist_ok=True)"
+"# Graficar
+plt.figure(figsize=(12,6))
+plt.scatter(df_est_clean[""fecha""], df_est_clean[""pm25""], s=1, c=""gray"" ,label=""Estaciones"")
+plt.scatter(df_sen_clean[""fecha""], df_sen_clean[""pm25""], s=1, c=""red"", label=""Sensores"", alpha=0.6)
+plt.xlabel(""Fecha"")
+plt.ylabel(""PM2.5 [µg/m³]"")
+plt.title(""Comparación de mediciones PM2.5 (Estaciones vs Sensores)"")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# Rutas a los archivos ya cargados aquí
+file_estaciones = ""/mnt/data/Datos_Estaciones_AMB.xlsx""
+file_sensores = ""/mnt/data/Sensor.xlsx"""
+"from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+
+out_dir = Path.home() / ""Taller_distancias"" / ""moviles_pm25""
+out_dir.mkdir(parents=True, exist_ok=True)
+
+# Ventanas de 30 min (0.5 h) hasta 48 h -> 96 pasos
+windows = [pd.Timedelta(minutes=30*i) for i in range(1, 96+1)]  # 0.5h, 1.0h, ..., 48.0h
+
+def fmt_td(td: pd.Timedelta) -> str:
+    """"""Formato limpio para etiquetas y archivos (ej. '1h30m', '24h00m').""""""
+    total_min = int(td.total_seconds() // 60)
+    h, m = divmod(total_min, 60)
+    return f""{h}h{m:02d}m""
+
+# Chequeo rápido (asegúrate de que los índices son DatetimeIndex)
+print(""[EST] puntos:"", len(df_est), ""rango:"", df_est.index.min(), ""→"", df_est.index.max())
+print(""[SEN] puntos:"", len(df_sen), ""rango:"", df_sen.index.min(), ""→"", df_sen.index.max())
+
+# Construye promedios móviles y guarda CSVs
+ma_results = {}
+for td in windows:
+    label = fmt_td(td)                # p. ej. '0h30m', '1h00m', ...
+    est_ma = df_est[""pm25""].rolling(td, min_periods=1).mean()
+    sen_ma = df_sen[""pm25""].rolling(td, min_periods=1).mean()
+    ma_results[label] = (est_ma, sen_ma)
+
+    est_ma.rename(f""estaciones_PM25_MA_{label}"").to_frame().to_csv(out_dir / f""estaciones_MA_{label}.csv"")
+    sen_ma.rename(f""sensores_PM25_MA_{label}"").to_frame().to_csv(out_dir / f""sensores_MA_{label}.csv"")
+
+print(""Llaves en ma_results:"", list(ma_results.keys())[:6], ""..."", list(ma_results.keys())[-6:])
+
+# Graficar y guardar (solo puntos)
+for label, (est_ma, sen_ma) in ma_results.items():
+    n1, n2 = est_ma.notna().sum(), sen_ma.notna().sum()
+    print(f""[{label}] puntos est={n1}  sen={n2}"")
+    if n1 == 0 or n2 == 0:
+        print(f""  -> saltado {label} (serie vacía)"")
+        continue
+
+    est_x, est_y = est_ma.dropna().index, est_ma.dropna().values
+    sen_x, sen_y = sen_ma.dropna().index, sen_ma.dropna().values
+
+    plt.figure(figsize=(12, 5))
+    plt.scatter(est_x, est_y, s=1, label=f""Estaciones — MA {label}"", alpha=0.8)
+    plt.scatter(sen_x, sen_y, s=1, label=f""Sensores — MA {label}"", alpha=0.8)
+
+    plt.title(f""PM2.5 — Promedio móvil {label}"")
+    plt.xlabel(""Fecha""); plt.ylabel(""PM2.5 [µg/m³]"")
+    plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+
+    out_png = out_dir / f""pm25_MA_{label}.png""
+    plt.savefig(out_png, dpi=150)
+    print(f""  [OK] guardado: {out_png}"")
+
+    # (opcional) mostrar en entornos interactivos
+    # plt.show()"
+"# ============================================
+# PM2.5 — MA (cada 30 min hasta 48 h) + Ajuste E=λS con TOLERANCIA RELATIVA 10%
+# ============================================
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ---------- Config ----------
+file_estaciones = r""C:\Users\Usuario\Downloads\taller mediciones\Datos_Estaciones_AMB.xlsx""
+file_sensores   = r""C:\Users\Usuario\Downloads\taller mediciones\Sensor.xlsx""
+out_dir = Path.home() / ""Taller_distancias"" / ""moviles_pm25""
+out_dir.mkdir(parents=True, exist_ok=True)
+
+win_elegida = ""48h""         # puedes usar '0h30m', '1h30m', '90min', etc.
+tol_rel     = 0.10          # SOLO tolerancia relativa (10%)
+pareo_tol   = pd.Timedelta(""60min"")
+mostrar_serie_tiempo = False
+
+# ---------- Carga y limpieza ----------
+df_est = pd.read_excel(file_estaciones)
+df_est = df_est.rename(columns={""Date&Time"": ""fecha"", ""PM2.5"": ""pm25""})
+df_est = df_est.iloc[1:, :]
+df_est = df_est[df_est[""pm25""] != ""NoData""][[""fecha"", ""pm25""]].copy()
+df_est[""fecha""] = pd.to_datetime(df_est[""fecha""], errors=""coerce"")
+df_est[""pm25""]  = pd.to_numeric(df_est[""pm25""], errors=""coerce"")
+df_est = df_est.dropna().sort_values(""fecha"").set_index(""fecha"")
+
+df_sen = pd.read_excel(file_sensores)
+df_sen = df_sen.rename(columns={""time"": ""fecha"", ""pm25"": ""pm25""})[[""fecha"", ""pm25""]].copy()
+df_sen[""fecha""] = pd.to_datetime(df_sen[""fecha""], errors=""coerce"")
+df_sen[""pm25""]  = pd.to_numeric(df_sen[""pm25""], errors=""coerce"")
+df_sen = df_sen.dropna().sort_values(""fecha"").set_index(""fecha"")
+
+print(""[EST] puntos:"", len(df_est), ""rango:"", df_est.index.min(), ""→"", df_est.index.max())
+print(""[SEN] puntos:"", len(df_sen), ""rango:"", df_sen.index.min(), ""→"", df_sen.index.max())
+
+# ---------- Helpers ----------
+def _to_timedelta(w) -> pd.Timedelta:
+    if isinstance(w, pd.Timedelta):
+        return w
+    s = str(w).strip().lower().replace("" "", """")
+    s = s.replace(""mins"", ""min"").replace(""mns"", ""min"").replace(""hr"", ""h"")
+    if s.endswith(""m"") and not s.endswith(""min""):
+        s = s[:-1] + ""min""
+    return pd.to_timedelta(s)
+
+def fmt_td(td: pd.Timedelta) -> str:
+    total_min = int(td.total_seconds() // 60)
+    h, m = divmod(total_min, 60)
+    return f""{h}h{m:02d}m""
+
+# =======================
+# INPUT: ventana en horas
+# =======================
+def pedir_ventana_usuario(min_h=0.5, max_h=48.0, paso=0.5) -> tuple[pd.Timedelta, str]:
+    """"""
+    Pide al usuario una ventana en horas (múltiplos de 0.5),
+    la valida y devuelve (Timedelta, etiqueta 'HhMMm').
+    """"""
+    while True:
+        s = input(f""Ventana en horas (múltiplos de {paso}, entre {min_h} y {max_h}): "").strip()
+        s = s.replace("","", ""."")  # permitir 1,5
+        try:
+            h = float(s)
+        except ValueError:
+            print(""✖ Entrada no numérica. Intenta de nuevo."")
+            continue
+
+        if not (min_h <= h <= max_h):
+            print(f""✖ Fuera de rango [{min_h}, {max_h}]. Intenta de nuevo."")
+            continue
+
+        # validar múltiplos de 0.5
+        if abs(h / paso - round(h / paso)) > 1e-9:
+            print(f""✖ Debe ser múltiplo de {paso}. Ej: 0.5, 1.0, 1.5, …"")
+            continue
+
+        td = pd.Timedelta(hours=h)
+        label = fmt_td(td)   # '0h30m', '1h30m', etc.
+        print(f""✔ Ventana seleccionada: {label}"")
+        return td, label
+
+# ===========================
+# Ejecutar ajuste con entrada
+# ===========================
+td_sel, label_sel = pedir_ventana_usuario()        # pide 0.5h, 1.0h, 1.5h, …, 48h
+pair = ma_results.get(label_sel)
+if pair is None:
+    # si no estaba precalculada, la construimos y cacheamos
+    est_ma = df_est[""pm25""].rolling(td_sel, min_periods=1).mean()
+    sen_ma = df_sen[""pm25""].rolling(td_sel, min_periods=1).mean()
+    ma_results[label_sel] = (est_ma, sen_ma)
+else:
+    est_ma, sen_ma = pair
+
+# Normalizar índices
+for s in (est_ma, sen_ma):
+    try: s.index = s.index.tz_convert(None)
+    except Exception: pass
+    try: s.index = s.index.tz_localize(None)
+    except Exception: pass
+
+# Emparejar por cercanía temporal
+est_df = est_ma.dropna().rename(""E"").to_frame().reset_index().rename(columns={est_ma.index.name or ""index"": ""t""})
+sen_df = sen_ma.dropna().rename(""S"").to_frame().reset_index().rename(columns={sen_ma.index.name or ""index"": ""t""})
+est_df = est_df.sort_values(""t""); sen_df = sen_df.sort_values(""t"")
+
+df_pair = pd.merge_asof(est_df, sen_df, on=""t"", direction=""nearest"",
+                        tolerance=pd.Timedelta(""60min"")).dropna()
+if df_pair.empty:
+    print(""[Aviso] merge_asof sin pares. Intentando resampleo a 1H…"")
+    est_r = est_ma.resample(""1H"").mean()
+    sen_r = sen_ma.resample(""1H"").mean()
+    df_pair = pd.concat({""E"": est_r, ""S"": sen_r}, axis=1).dropna().reset_index()
+    df_pair = df_pair.rename(columns={df_pair.columns[0]: ""t""})
+if df_pair.empty:
+    raise RuntimeError(f""No hay pares E,S para {label_sel} incluso tras resampleo."")
+
+# Mínimos cuadrados E = λ S
+s = df_pair[""S""].values.astype(float)
+e = df_pair[""E""].values.astype(float)
+den = float(np.dot(s, s))
+lam = np.nan if den == 0 else float(np.dot(s, e) / den)
+yhat = lam * s
+res  = e - yhat
+rmse = float(np.sqrt(np.mean(res**2)))
+mae  = float(np.mean(np.abs(res)))
+
+print(f""[Ajuste] MA={label_sel}  λ={lam:.6g}  RMSE={rmse:.3f}  MAE={mae:.3f}"")
+
+# ===============================
+# Bandas PARALELAS ±10% (rango y)
+# ===============================
+s_line = np.linspace(s.min(), s.max(), 200)
+e_line = lam * s_line
+y_span = e_line.max() - e_line.min()
+offset = 0.10 * y_span             # ← 10% del rango de la recta en el dominio observado (PARALELAS)
+upper  = e_line + offset
+lower  = e_line - offset
+
+dentro = np.abs(res) <= offset
+fuera  = ~dentro
+print(f""[Paralelas ±10%] dentro={int(dentro.sum())}/{len(res)}  fuera={int(fuera.sum())}/{len(res)}  offset={offset:.3f}"")
+
+# Gráfica
+plt.figure(figsize=(8,6))
+plt.scatter(s[dentro], e[dentro], s=9, label=""Dentro ±10%"", alpha=0.8)
+plt.scatter(s[fuera],  e[fuera],  s=7, label=""Fuera ±10%"",  alpha=0.9)
+plt.plot(s_line, e_line, lw=2, c=""red"",   label=f""Ajuste E = λ·S (λ={lam:.3f})"")
+plt.plot(s_line, upper,  lw=1, c=""green"", linestyle=""--"", label=""+10% (paralela)"")
+plt.plot(s_line, lower,  lw=1, c=""green"", linestyle=""--"", label=""-10% (paralela)"")
+plt.title(f""E (estación) vs S (sensor) — MA {label_sel} — Banda paralela ±10%"")
+plt.xlabel(""Sensor S [µg/m³]""); plt.ylabel(""Estación E [µg/m³]"")
+plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+
+out_png = out_dir / f""ajuste_dispersion_{label_sel}_paralelas10.png""
+plt.savefig(out_png, dpi=150)
+print(f""[OK] guardado: {out_png}"")
+plt.show()
+
+# ---------- Ventanas: solo 30 min → 48 h ----------
+_windows_td  = [pd.Timedelta(minutes=30*i) for i in range(1, 96+1)]  # 0.5h … 48h
+_windows_lbl = [fmt_td(td) for td in _windows_td]
+
+# ---------- Móviles + CSV ----------
+ma_results = {}
+for td, label in zip(_windows_td, _windows_lbl):
+    est_ma = df_est[""pm25""].rolling(td, min_periods=1).mean()
+    sen_ma = df_sen[""pm25""].rolling(td, min_periods=1).mean()
+    ma_results[label] = (est_ma, sen_ma)
+    est_ma.rename(f""estaciones_PM25_MA_{label}"").to_frame().to_csv(out_dir / f""estaciones_MA_{label}.csv"")
+    sen_ma.rename(f""sensores_PM25_MA_{label}"").to_frame().to_csv(out_dir / f""sensores_MA_{label}.csv"")
+
+print(""Ventanas (ejemplos):"", _windows_lbl[:6], ""… total:"", len(_windows_lbl))
+
+# ---------- Obtener MA para la ventana elegida ----------
+def _get_ma_or_build(w):
+    td = _to_timedelta(w)
+    label = fmt_td(td)
+    if label in ma_results:
+        return ma_results[label], label, td
+    est_ma = df_est[""pm25""].rolling(td, min_periods=1).mean()
+    sen_ma = df_sen[""pm25""].rolling(td, min_periods=1).mean()
+    ma_results[label] = (est_ma, sen_ma)
+    return (est_ma, sen_ma), label, td
+
+(pair, label_sel, td_sel) = _get_ma_or_build(win_elegida)
+est_ma, sen_ma = pair
+
+# ---------- Pareo temporal ----------
+for s in (est_ma, sen_ma):
+    try: s.index = s.index.tz_convert(None)
+    except: pass
+    try: s.index = s.index.tz_localize(None)
+    except: pass
+
+est_df = est_ma.dropna().rename(""E"").to_frame().reset_index().rename(columns={""fecha"":""t""})
+sen_df = sen_ma.dropna().rename(""S"").to_frame().reset_index().rename(columns={""fecha"":""t""})
+if ""t"" not in est_df.columns: est_df = est_df.rename(columns={est_df.columns[0]: ""t""})
+if ""t"" not in sen_df.columns: sen_df = sen_df.rename(columns={sen_df.columns[0]: ""t""})
+est_df = est_df.sort_values(""t""); sen_df = sen_df.sort_values(""t"")
+
+df_pair = pd.merge_asof(est_df, sen_df, on=""t"", direction=""nearest"", tolerance=pareo_tol).dropna()
+if df_pair.empty:
+    print(""[Aviso] merge_asof sin pares. Intentando resampleo a 1H…"")
+    est_r = est_ma.resample(""1H"").mean()
+    sen_r = sen_ma.resample(""1H"").mean()
+    df_pair = pd.concat({""E"": est_r, ""S"": sen_r}, axis=1).dropna().reset_index()
+    df_pair = df_pair.rename(columns={df_pair.columns[0]: ""t""})
+if df_pair.empty:
+    raise RuntimeError(f""No hay pares E,S para {label_sel} incluso tras resampleo. Ajusta pareo_tol."")
+
+# ---------- Ajuste λ ----------
+s = df_pair[""S""].values.astype(float)
+e = df_pair[""E""].values.astype(float)
+den = float(np.dot(s, s))
+lam = np.nan if den == 0 else float(np.dot(s, e) / den)
+
+yhat = lam * s
+res  = e - yhat
+rmse = float(np.sqrt(np.mean(res**2)))
+mae  = float(np.mean(np.abs(res)))
+print(f""[Ajuste] MA={label_sel}  λ={lam:.6g}  RMSE={rmse:.3f}  MAE={mae:.3f}"")
+
+# ---------- Tolerancia RELATIVA (10%) con LÍNEAS PARALELAS ----------
+S_vals = df_pair[""S""].values
+E_vals = df_pair[""E""].values
+
+# Recta de ajuste
+s_line = np.linspace(S_vals.min(), S_vals.max(), 200)
+e_line = lam * s_line
+
+# Desplazamiento vertical constante = 10% del RANGO de la recta en el dominio observado
+y_span = e_line.max() - e_line.min()      # rango de λS en [Smin, Smax]
+offset = 0.10 * y_span                    # <-- 10% (cámbialo si quieres otro %)
+
+upper = e_line + offset                   # paralela superior
+lower = e_line - offset                   # paralela inferior
+
+# Clasificación (banda de ancho constante ±offset alrededor de la recta)
+yhat   = lam * S_vals
+res    = E_vals - yhat
+dentro = np.abs(res) <= offset
+fuera  = ~dentro
+n_tot, n_in, n_out = len(E_vals), int(dentro.sum()), int(fuera.sum())
+print(f""[Paralelas ±10% rango] dentro={n_in}/{n_tot}  fuera={n_out}/{n_tot}  offset={offset:.3f}"")
+
+# ---------- Gráfica ----------
+plt.figure(figsize=(8,6))
+plt.scatter(S_vals[dentro], E_vals[dentro], s=9, label=""Dentro rango"", alpha=0.8)
+plt.scatter(S_vals[fuera],  E_vals[fuera],  s=7, label=""Fuera rango"",  alpha=0.9)
+plt.plot(s_line, e_line, lw=2, c=""red"",   label=f""λ={lam:.3f}"")
+plt.plot(s_line, upper,  lw=1, c=""green"", linestyle=""--"")
+plt.plot(s_line, lower,  lw=1, c=""green"", linestyle=""--"")
+plt.title(f""estación vs sensor — {fmt_td(_to_timedelta(win_elegida))} — toleracia 10%"")
+plt.xlabel(""Sensor S [µg/m³]""); plt.ylabel(""Estación E [µg/m³]"")
+plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+out_disp = out_dir / f""ajuste_dispersion_{fmt_td(_to_timedelta(win_elegida))}_rel10_parallel.png""
+plt.savefig(out_disp, dpi=150)
+print(f""[OK] guardado: {out_disp}"")
+plt.show()"
+"# ============================================
+# PM2.5 — MA (cada 30 min hasta 48 h) + Ajuste E=λS con TOLERANCIA RELATIVA 10%
+# ============================================
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ---------- Config ----------
+file_estaciones = r""C:\Users\Usuario\Downloads\taller mediciones\Datos_Estaciones_AMB.xlsx""
+file_sensores   = r""C:\Users\Usuario\Downloads\taller mediciones\Sensor.xlsx""
+out_dir = Path.home() / ""Taller_distancias"" / ""moviles_pm25""
+out_dir.mkdir(parents=True, exist_ok=True)
+
+win_elegida = ""48h""         # puedes usar '0h30m', '1h30m', '90min', etc.
+tol_rel     = 0.10          # SOLO tolerancia relativa (10%)
+pareo_tol   = pd.Timedelta(""60min"")
+mostrar_serie_tiempo = False
+
+# ---------- Carga y limpieza ----------
+df_est = pd.read_excel(file_estaciones)
+df_est = df_est.rename(columns={""Date&Time"": ""fecha"", ""PM2.5"": ""pm25""})
+df_est = df_est.iloc[1:, :]
+df_est = df_est[df_est[""pm25""] != ""NoData""][[""fecha"", ""pm25""]].copy()
+df_est[""fecha""] = pd.to_datetime(df_est[""fecha""], errors=""coerce"")
+df_est[""pm25""]  = pd.to_numeric(df_est[""pm25""], errors=""coerce"")
+df_est = df_est.dropna().sort_values(""fecha"").set_index(""fecha"")
+
+df_sen = pd.read_excel(file_sensores)
+df_sen = df_sen.rename(columns={""time"": ""fecha"", ""pm25"": ""pm25""})[[""fecha"", ""pm25""]].copy()
+df_sen[""fecha""] = pd.to_datetime(df_sen[""fecha""], errors=""coerce"")
+df_sen[""pm25""]  = pd.to_numeric(df_sen[""pm25""], errors=""coerce"")
+df_sen = df_sen.dropna().sort_values(""fecha"").set_index(""fecha"")
+
+print(""[EST] puntos:"", len(df_est), ""rango:"", df_est.index.min(), ""→"", df_est.index.max())
+print(""[SEN] puntos:"", len(df_sen), ""rango:"", df_sen.index.min(), ""→"", df_sen.index.max())
+
+# ---------- Helpers ----------
+def _to_timedelta(w) -> pd.Timedelta:
+    if isinstance(w, pd.Timedelta):
+        return w
+    s = str(w).strip().lower().replace("" "", """")
+    s = s.replace(""mins"", ""min"").replace(""mns"", ""min"").replace(""hr"", ""h"")
+    if s.endswith(""m"") and not s.endswith(""min""):
+        s = s[:-1] + ""min""
+    return pd.to_timedelta(s)
+
+def fmt_td(td: pd.Timedelta) -> str:
+    total_min = int(td.total_seconds() // 60)
+    h, m = divmod(total_min, 60)
+    return f""{h}h{m:02d}m""
+
+# =======================
+# INPUT: ventana en horas
+# =======================
+def pedir_ventana_usuario(min_h=0.5, max_h=48.0, paso=0.5) -> tuple[pd.Timedelta, str]:
+    """"""
+    Pide al usuario una ventana en horas (múltiplos de 0.5),
+    la valida y devuelve (Timedelta, etiqueta 'HhMMm').
+    """"""
+    while True:
+        s = input(f""Ventana en horas (múltiplos de {paso}, entre {min_h} y {max_h}): "").strip()
+        s = s.replace("","", ""."")  # permitir 1,5
+        try:
+            h = float(s)
+        except ValueError:
+            print(""✖ Entrada no numérica. Intenta de nuevo."")
+            continue
+
+        if not (min_h <= h <= max_h):
+            print(f""✖ Fuera de rango [{min_h}, {max_h}]. Intenta de nuevo."")
+            continue
+
+        # validar múltiplos de 0.5
+        if abs(h / paso - round(h / paso)) > 1e-9:
+            print(f""✖ Debe ser múltiplo de {paso}. Ej: 0.5, 1.0, 1.5, …"")
+            continue
+
+        td = pd.Timedelta(hours=h)
+        label = fmt_td(td)   # '0h30m', '1h30m', etc.
+        print(f""✔ Ventana seleccionada: {label}"")
+        return td, label
+
+# ===========================
+# Ejecutar ajuste con entrada
+# ===========================
+td_sel, label_sel = pedir_ventana_usuario()        # pide 0.5h, 1.0h, 1.5h, …, 48h
+pair = ma_results.get(label_sel)
+if pair is None:
+    # si no estaba precalculada, la construimos y cacheamos
+    est_ma = df_est[""pm25""].rolling(td_sel, min_periods=1).mean()
+    sen_ma = df_sen[""pm25""].rolling(td_sel, min_periods=1).mean()
+    ma_results[label_sel] = (est_ma, sen_ma)
+else:
+    est_ma, sen_ma = pair
+
+# Normalizar índices
+for s in (est_ma, sen_ma):
+    try: s.index = s.index.tz_convert(None)
+    except Exception: pass
+    try: s.index = s.index.tz_localize(None)
+    except Exception: pass
+
+# Emparejar por cercanía temporal
+est_df = est_ma.dropna().rename(""E"").to_frame().reset_index().rename(columns={est_ma.index.name or ""index"": ""t""})
+sen_df = sen_ma.dropna().rename(""S"").to_frame().reset_index().rename(columns={sen_ma.index.name or ""index"": ""t""})
+est_df = est_df.sort_values(""t""); sen_df = sen_df.sort_values(""t"")
+
+df_pair = pd.merge_asof(est_df, sen_df, on=""t"", direction=""nearest"",
+                        tolerance=pd.Timedelta(""60min"")).dropna()
+if df_pair.empty:
+    print(""[Aviso] merge_asof sin pares. Intentando resampleo a 1H…"")
+    est_r = est_ma.resample(""1H"").mean()
+    sen_r = sen_ma.resample(""1H"").mean()
+    df_pair = pd.concat({""E"": est_r, ""S"": sen_r}, axis=1).dropna().reset_index()
+    df_pair = df_pair.rename(columns={df_pair.columns[0]: ""t""})
+if df_pair.empty:
+    raise RuntimeError(f""No hay pares E,S para {label_sel} incluso tras resampleo."")
+
+# Mínimos cuadrados E = λ S
+s = df_pair[""S""].values.astype(float)
+e = df_pair[""E""].values.astype(float)
+den = float(np.dot(s, s))
+lam = np.nan if den == 0 else float(np.dot(s, e) / den)
+yhat = lam * s
+res  = e - yhat
+rmse = float(np.sqrt(np.mean(res**2)))
+mae  = float(np.mean(np.abs(res)))
+
+print(f""[Ajuste] MA={label_sel}  λ={lam:.6g}  RMSE={rmse:.3f}  MAE={mae:.3f}"")
+
+# ===============================
+# Bandas PARALELAS ±10% (rango y)
+# ===============================
+s_line = np.linspace(s.min(), s.max(), 200)
+e_line = lam * s_line
+y_span = e_line.max() - e_line.min()
+offset = 0.10 * y_span             # ← 10% del rango de la recta en el dominio observado (PARALELAS)
+upper  = e_line + offset
+lower  = e_line - offset
+
+dentro = np.abs(res) <= offset
+fuera  = ~dentro
+print(f""[Paralelas ±10%] dentro={int(dentro.sum())}/{len(res)}  fuera={int(fuera.sum())}/{len(res)}  offset={offset:.3f}"")
+
+# Gráfica
+plt.figure(figsize=(8,6))
+plt.scatter(s[dentro], e[dentro], s=9, label=""Dentro ±10%"", alpha=0.8)
+plt.scatter(s[fuera],  e[fuera],  s=7, label=""Fuera ±10%"",  alpha=0.9)
+plt.plot(s_line, e_line, lw=2, c=""red"",   label=f""Ajuste E = λ·S (λ={lam:.3f})"")
+plt.plot(s_line, upper,  lw=1, c=""green"", linestyle=""--"", label=""+10% (paralela)"")
+plt.plot(s_line, lower,  lw=1, c=""green"", linestyle=""--"", label=""-10% (paralela)"")
+plt.title(f""E (estación) vs S (sensor) — MA {label_sel} — Banda paralela ±10%"")
+plt.xlabel(""Sensor S [µg/m³]""); plt.ylabel(""Estación E [µg/m³]"")
+plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+
+out_png = out_dir / f""ajuste_dispersion_{label_sel}_paralelas10.png""
+plt.savefig(out_png, dpi=150)
+print(f""[OK] guardado: {out_png}"")
+plt.show()
+
+# ---------- Ventanas: solo 30 min → 48 h ----------
+_windows_td  = [pd.Timedelta(minutes=30*i) for i in range(1, 96+1)]  # 0.5h … 48h
+_windows_lbl = [fmt_td(td) for td in _windows_td]
+
+# ---------- Móviles + CSV ----------
+ma_results = {}
+for td, label in zip(_windows_td, _windows_lbl):
+    est_ma = df_est[""pm25""].rolling(td, min_periods=1).mean()
+    sen_ma = df_sen[""pm25""].rolling(td, min_periods=1).mean()
+    ma_results[label] = (est_ma, sen_ma)
+    est_ma.rename(f""estaciones_PM25_MA_{label}"").to_frame().to_csv(out_dir / f""estaciones_MA_{label}.csv"")
+    sen_ma.rename(f""sensores_PM25_MA_{label}"").to_frame().to_csv(out_dir / f""sensores_MA_{label}.csv"")
+
+print(""Ventanas (ejemplos):"", _windows_lbl[:6], ""… total:"", len(_windows_lbl))
+
+# ---------- Obtener MA para la ventana elegida ----------
+def _get_ma_or_build(w):
+    td = _to_timedelta(w)
+    label = fmt_td(td)
+    if label in ma_results:
+        return ma_results[label], label, td
+    est_ma = df_est[""pm25""].rolling(td, min_periods=1).mean()
+    sen_ma = df_sen[""pm25""].rolling(td, min_periods=1).mean()
+    ma_results[label] = (est_ma, sen_ma)
+    return (est_ma, sen_ma), label, td
+
+(pair, label_sel, td_sel) = _get_ma_or_build(win_elegida)
+est_ma, sen_ma = pair
+
+# ---------- Pareo temporal ----------
+for s in (est_ma, sen_ma):
+    try: s.index = s.index.tz_convert(None)
+    except: pass
+    try: s.index = s.index.tz_localize(None)
+    except: pass
+
+est_df = est_ma.dropna().rename(""E"").to_frame().reset_index().rename(columns={""fecha"":""t""})
+sen_df = sen_ma.dropna().rename(""S"").to_frame().reset_index().rename(columns={""fecha"":""t""})
+if ""t"" not in est_df.columns: est_df = est_df.rename(columns={est_df.columns[0]: ""t""})
+if ""t"" not in sen_df.columns: sen_df = sen_df.rename(columns={sen_df.columns[0]: ""t""})
+est_df = est_df.sort_values(""t""); sen_df = sen_df.sort_values(""t"")
+
+df_pair = pd.merge_asof(est_df, sen_df, on=""t"", direction=""nearest"", tolerance=pareo_tol).dropna()
+if df_pair.empty:
+    print(""[Aviso] merge_asof sin pares. Intentando resampleo a 1H…"")
+    est_r = est_ma.resample(""1H"").mean()
+    sen_r = sen_ma.resample(""1H"").mean()
+    df_pair = pd.concat({""E"": est_r, ""S"": sen_r}, axis=1).dropna().reset_index()
+    df_pair = df_pair.rename(columns={df_pair.columns[0]: ""t""})
+if df_pair.empty:
+    raise RuntimeError(f""No hay pares E,S para {label_sel} incluso tras resampleo. Ajusta pareo_tol."")
+
+# ---------- Ajuste λ ----------
+s = df_pair[""S""].values.astype(float)
+e = df_pair[""E""].values.astype(float)
+den = float(np.dot(s, s))
+lam = np.nan if den == 0 else float(np.dot(s, e) / den)
+
+yhat = lam * s
+res  = e - yhat
+rmse = float(np.sqrt(np.mean(res**2)))
+mae  = float(np.mean(np.abs(res)))
+print(f""[Ajuste] MA={label_sel}  λ={lam:.6g}  RMSE={rmse:.3f}  MAE={mae:.3f}"")
+
+# ---------- Tolerancia RELATIVA (10%) con LÍNEAS PARALELAS ----------
+S_vals = df_pair[""S""].values
+E_vals = df_pair[""E""].values
+
+# Recta de ajuste
+s_line = np.linspace(S_vals.min(), S_vals.max(), 200)
+e_line = lam * s_line
+
+# Desplazamiento vertical constante = 10% del RANGO de la recta en el dominio observado
+y_span = e_line.max() - e_line.min()      # rango de λS en [Smin, Smax]
+offset = 0.10 * y_span                    # <-- 10% (cámbialo si quieres otro %)
+
+upper = e_line + offset                   # paralela superior
+lower = e_line - offset                   # paralela inferior
+
+# Clasificación (banda de ancho constante ±offset alrededor de la recta)
+yhat   = lam * S_vals
+res    = E_vals - yhat
+dentro = np.abs(res) <= offset
+fuera  = ~dentro
+n_tot, n_in, n_out = len(E_vals), int(dentro.sum()), int(fuera.sum())
+print(f""[Paralelas ±10% rango] dentro={n_in}/{n_tot}  fuera={n_out}/{n_tot}  offset={offset:.3f}"")
+
+# ---------- Gráfica ----------
+plt.figure(figsize=(8,6))
+plt.scatter(S_vals[dentro], E_vals[dentro], s=9, label=""Dentro rango"", alpha=0.8)
+plt.scatter(S_vals[fuera],  E_vals[fuera],  s=7,  alpha=0.9)
+plt.plot(s_line, e_line, lw=2, c=""red"",   label=f""λ={lam:.3f}"")
+plt.plot(s_line, upper,  lw=1, c=""green"", linestyle=""--"")
+plt.plot(s_line, lower,  lw=1, c=""green"", linestyle=""--"")
+plt.title(f""estación vs sensor — {fmt_td(_to_timedelta(win_elegida))} — toleracia 10%"")
+plt.xlabel(""Sensor S [µg/m³]""); plt.ylabel(""Estación E [µg/m³]"")
+plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+out_disp = out_dir / f""ajuste_dispersion_{fmt_td(_to_timedelta(win_elegida))}_rel10_parallel.png""
+plt.savefig(out_disp, dpi=150)
+print(f""[OK] guardado: {out_disp}"")
+plt.show()"
+"# ==============================
+# Distancia entre series suavizadas (RMSE/MAE/L2_tiempo)
+# ==============================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# --------- CONFIGURACIÓN ---------
+# Rutas por defecto en tu PC (solo se usan si df_est/df_sen no existen ya)
+BASE_EST_DIR = Path(r""C:\Users\Usuario\Downloads\asignacion_1"")
+SENSORS_DIR  = BASE_EST_DIR / ""mediciones""
+
+# Carpeta de salida
+OUT_DIR = Path.home() / ""Taller_distancias"" / ""distancias""
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Ventanas (en horas)
+WINDOW_START = 2   # inicio
+WINDOW_END   = 120 # fin
+WINDOW_STEP  = 2   # paso (4h)
+WINDOWS = [f""{h}h"" for h in range(WINDOW_START, WINDOW_END + 1, WINDOW_STEP)]
+
+# Modo de suavizado:
+#  - ""loose"": rolling por ventana de tiempo (min_periods=1) -> bordes permisivos.
+#  - ""strict"": resample 1H y rolling por N muestras (min_periods=N) -> exige ventana completa.
+SMOOTH_MODE = ""loose""   # ""loose"" o ""strict""
+
+# Métrica principal a reportar en la gráfica (además se guardan las otras)
+PRIMARY_METRIC = ""rmse""  # ""rmse"", ""mae"" o ""l2_time""
+
+
+# --------- HELPERS GENERALES ---------
+def find_column_by_keywords(columns, keywords):
+    cols_l = [str(c).lower() for c in columns]
+    for kw in keywords:
+        for i, c in enumerate(cols_l):
+            if kw.lower() in c:
+                return columns[i]
+    return None
+
+def parse_datetime_series(srs):
+    """"""Convierte robustamente a datetime (serial Excel si mayormente numérico; si no, dayfirst/False).""""""
+    s = srs.copy()
+    s_nn = s.dropna()
+    n = len(s_nn)
+    if n == 0:
+        return pd.to_datetime(s, errors=""coerce"")
+
+    # ¿Mayormente numérico? -> serial Excel
+    numeric_count = sum(isinstance(x, (int, float, np.integer, np.floating)) for x in s_nn)
+    if n > 0 and numeric_count / n > 0.75:
+        parsed_excel = pd.to_datetime(s, unit='d', origin='1899-12-30', errors='coerce')
+        if parsed_excel.notna().sum() > 0:
+            return parsed_excel
+
+    d1 = pd.to_datetime(s, dayfirst=True, errors='coerce')
+    d2 = pd.to_datetime(s, dayfirst=False, errors='coerce')
+    return d1 if d1.notna().sum() >= d2.notna().sum() else d2
+
+def safe_numeric(srs):
+    return pd.to_numeric(srs, errors='coerce')
+
+def _prep_df(df, name):
+    """"""Asegura DateTimeIndex y columna 'pm25'.""""""
+    if ""pm25"" not in df.columns:
+        if len(df.columns) == 1:
+            df = df.rename(columns={df.columns[0]: ""pm25""})
+        else:
+            raise ValueError(f""{name} no tiene columna 'pm25'."")
+    idx = pd.to_datetime(df.index, errors=""coerce"")
+    out = df.copy()
+    out.index = idx
+    out = out.dropna(subset=[""pm25""]).sort_index()
+    return out
+
+def _exists_df(name, g):
+    return (name in g) and isinstance(g[name], pd.DataFrame)
+
+# --------- CARGA DE ESTACIONES/SENSORES (si no existen) ---------
+def load_estaciones_from_dir(base_dir: Path):
+    """"""Busca un Excel de estaciones en base_dir y devuelve DF indexado por tiempo con columna pm25.""""""
+    xlsx_files = list(base_dir.glob(""*.xlsx""))
+    if not xlsx_files:
+        return None
+    # Prioriza nombres con 'estacion' o 'amb'
+    prio = [p for p in xlsx_files if (""estacion"" in p.stem.lower() or ""amb"" in p.stem.lower())]
+    ref_file = prio[0] if prio else xlsx_files[0]
+
+    try:
+        df = pd.read_excel(ref_file, header=[0,1], engine=""openpyxl"")
+        # Aplana si MultiIndex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [""_"".join([str(x) for x in tup if str(x) != ""nan"" and str(x).strip() != """"]).strip() or ""unnamed""
+                          for tup in df.columns]
+    except Exception:
+        df = pd.read_excel(ref_file, header=0, engine=""openpyxl"")
+
+    # Detectar columnas
+    time_col = find_column_by_keywords(df.columns, ['date&time', 'date', 'time', 'fecha', 'hora']) or df.columns[0]
+    pm_col   = (find_column_by_keywords(df.columns, ['pm2.5', 'pm 2.5', 'pm25', 'pm'])
+                or (df.columns[1] if len(df.columns) > 1 else df.columns[0]))
+
+    t = parse_datetime_series(df[time_col])
+    v = safe_numeric(df[pm_col])
+    out = pd.DataFrame({""pm25"": v}, index=t).dropna().sort_index()
+    return out
+
+def load_sensores_from_dir(sensors_dir: Path):
+    """"""Concatena todos los CSV de sensors_dir, detectando columnas tiempo/pm y promediando duplicados.""""""
+    import glob
+    csv_files = sorted(glob.glob(str(sensors_dir / ""*.csv"")))
+    if not csv_files:
+        return None
+
+    frames = []
+    for path in csv_files:
+        try:
+            d = pd.read_csv(path)
+        except Exception:
+            try:
+                d = pd.read_csv(path, sep="";"", encoding=""latin-1"")
+            except Exception:
+                continue
+
+        d.columns = [str(c).strip() for c in d.columns]
+        tcol = find_column_by_keywords(d.columns, ['date&time', 'date', 'time', 'fecha', 'hora']) or d.columns[0]
+        pcol = (find_column_by_keywords(d.columns, ['pm2.5', 'pm 2.5', 'pm25', 'pm'])
+                or (d.columns[1] if len(d.columns) > 1 else d.columns[0]))
+        tmp = pd.DataFrame({
+            ""tiempo"": parse_datetime_series(d[tcol]),
+            ""pm25"": safe_numeric(d[pcol])
+        }).dropna().sort_values(""tiempo"")
+        frames.append(tmp)
+
+    if not frames:
+        return None
+
+    df = pd.concat(frames, ignore_index=True)
+    df = df.set_index(""tiempo"").sort_index()
+    # Si hay múltiples sensores en el mismo instante, promedia
+    df = df.groupby(df.index).mean()
+    return df
+
+# Si no existen df_est / df_sen, intenta cargarlos desde las rutas por defecto
+g = globals()
+if not _exists_df(""df_est"", g) or not _exists_df(""df_sen"", g):
+    _est = load_estaciones_from_dir(BASE_EST_DIR)
+    _sen = load_sensores_from_dir(SENSORS_DIR)
+    if _est is None or _sen is None:
+        raise RuntimeError(""No encuentro df_est/df_sen ni pude cargar desde las rutas por defecto. Ajusta BASE_EST_DIR y SENSORS_DIR."")
+    df_est, df_sen = _prep_df(_est, ""df_est""), _prep_df(_sen, ""df_sen"")
+else:
+    df_est, df_sen = _prep_df(df_est, ""df_est""), _prep_df(df_sen, ""df_sen"")
+
+print(""[EST] n:"", len(df_est), ""rango:"", df_est.index.min(), ""→"", df_est.index.max())
+print(""[SEN] n:"", len(df_sen), ""rango:"", df_sen.index.min(), ""→"", df_sen.index.max())
+
+# --------- ALINEACIÓN POR CERCANÍA ---------
+def _to_naive_utc_index(s: pd.Series) -> pd.Series:
+    s = s.dropna().copy()
+    idx = pd.to_datetime(s.index, errors=""coerce"")
+    if getattr(idx, ""tz"", None) is not None:
+        idx = idx.tz_convert(""UTC"").tz_localize(None)
+    s.index = idx
+    return s.sort_index()
+
+def _delta_tipico(s: pd.Series) -> pd.Timedelta:
+    idx = s.index
+    if len(idx) < 2:
+        return pd.Timedelta(0)
+    return pd.Series(idx).diff().median()
+
+def alinear_por_cercania(ref: pd.Series, sen: pd.Series, window_str: str) -> pd.DataFrame:
+    """"""Empareja por tiempo más cercano con tolerancia estricta.""""""
+    ref_n = _to_naive_utc_index(ref)
+    sen_n = _to_naive_utc_index(sen)
+    w = pd.to_timedelta(window_str)
+
+    d_ref, d_sen = _delta_tipico(ref_n), _delta_tipico(sen_n)
+    # Tolerancia más conservadora
+    if d_ref > pd.Timedelta(0) and d_sen > pd.Timedelta(0):
+        base = min(d_ref, d_sen)
+    else:
+        base = w / 8
+    tol = min(base * 0.5, w / 8)
+
+    A = ref_n.rename(""ref"").reset_index().rename(columns={""index"": ""fecha""})
+    B = sen_n.rename(""sen"").reset_index().rename(columns={""index"": ""fecha""})
+    A[""fecha""] = pd.to_datetime(A[""fecha""], utc=False)
+    B[""fecha""] = pd.to_datetime(B[""fecha""], utc=False)
+    df = pd.merge_asof(A.sort_values(""fecha""), B.sort_values(""fecha""),
+                       on=""fecha"", direction=""nearest"", tolerance=tol)
+    return df.dropna(subset=[""ref"", ""sen""]).set_index(""fecha"").sort_index()
+
+# --------- MÉTRICAS DE DISTANCIA ---------
+def distancia_metricas(df_al: pd.DataFrame, metric=""rmse""):
+    """"""RMSE/MAE/L2 sobre puntos emparejados (no ponderado).""""""
+    if df_al.empty:
+        return np.nan
+    d = (df_al[""ref""] - df_al[""sen""]).to_numpy()
+    if metric == ""rmse"":
+        return float(np.sqrt(np.mean(d**2)))
+    elif metric == ""mae"":
+        return float(np.mean(np.abs(d)))
+    elif metric == ""l2"":
+        return float(np.sqrt(np.sum(d**2)))
+    else:
+        raise ValueError(""metric debe ser 'rmse', 'mae' o 'l2'."")
+
+def distancia_l2_timeweighted(df_al: pd.DataFrame) -> float:
+    """"""Aproxima ||ref - sen||_L2 = sqrt(∫ (r-s)^2 dt) por trapecios en tiempo.""""""
+    if len(df_al) < 2:
+        return np.nan
+    d2 = (df_al[""ref""] - df_al[""sen""]).to_numpy()**2
+    t = df_al.index.view(""int64"") / 1e9  # segundos
+    dt = np.diff(t)
+    mid = 0.5 * (d2[:-1] + d2[1:])
+    integral = np.sum(mid * dt)  # (valor^2)*s
+    return float(np.sqrt(integral))
+
+# --------- SUAVIZADO (rolling) ---------
+def compute_ma(series, win_str, mode):
+    if mode == ""loose"":
+        win = pd.Timedelta(win_str)                  # acepta '6h', '12h', etc.
+        return series.rolling(win, min_periods=1).mean()
+    elif mode == ""strict"":
+        s_reg = series.resample(""1h"").mean()         # minúscula
+        N = int(pd.Timedelta(win_str) / pd.Timedelta(""1h""))
+        return s_reg.rolling(N, min_periods=N).mean()
+
+
+# --------- CÁLCULO DE DISTANCIAS ---------
+rows = []
+for w in WINDOWS:
+    est_ma = compute_ma(df_est[""pm25""], w, SMOOTH_MODE)
+    sen_ma = compute_ma(df_sen[""pm25""], w, SMOOTH_MODE)
+
+    df_al = alinear_por_cercania(est_ma, sen_ma, w)
+    pares = len(df_al)
+
+    D_rmse   = distancia_metricas(df_al, ""rmse"")
+    D_mae    = distancia_metricas(df_al, ""mae"")
+    D_l2     = distancia_metricas(df_al, ""l2"")
+    D_l2time = distancia_l2_timeweighted(df_al)
+
+    rows.append({
+        ""ventana"": w,
+        ""pares"": pares,
+        ""rmse"": D_rmse,
+        ""mae"": D_mae,
+        ""l2"": D_l2,
+        ""l2_time"": D_l2time
+    })
+
+df_dist = pd.DataFrame(rows)
+df_dist[""horas""] = df_dist[""ventana""].str.replace(""h"", """", case=False).astype(int)
+df_dist = df_dist.sort_values(""horas"").reset_index(drop=True)
+
+# --------- RESÚMENES ---------
+print(""\nResumen (primeras filas):"")
+print(df_dist.head(10).to_string(index=False))
+
+validas = df_dist[df_dist[""pares""] > 0].copy()
+
+def best_row(metric):
+    vv = validas.dropna(subset=[metric])
+    return vv.loc[vv[metric].idxmin()] if not vv.empty else None
+
+best_rmse   = best_row(""rmse"")
+best_mae    = best_row(""mae"")
+best_l2time = best_row(""l2_time"")
+
+if best_rmse is not None:
+    print(f""\n[MEJOR RMSE] ventana={best_rmse['ventana']} | horas={int(best_rmse['horas'])} ""
+          f""| pares={int(best_rmse['pares'])} | RMSE={best_rmse['rmse']:.6f}"")
+if best_mae is not None:
+    print(f""[MEJOR MAE ] ventana={best_mae['ventana']} | horas={int(best_mae['horas'])} ""
+          f""| pares={int(best_mae['pares'])} | MAE={best_mae['mae']:.6f}"")
+if best_l2time is not None:
+    print(f""[MEJOR L2_t] ventana={best_l2time['ventana']} | horas={int(best_l2time['horas'])} ""
+          f""| pares={int(best_l2time['pares'])} | L2_t={best_l2time['l2_time']:.6f}"")
+
+# --------- GUARDAR CSV ---------
+csv_path = OUT_DIR / f""distancias_{SMOOTH_MODE}_{WINDOW_START}-{WINDOW_END}h_step{WINDOW_STEP}.csv""
+df_dist.to_csv(csv_path, index=False)
+print(f""\n[OK] Resultados guardados en: {csv_path}"")
+
+# --------- GRÁFICA (métrica primaria) ---------
+y = df_dist[PRIMARY_METRIC]
+plt.figure(figsize=(9,5))
+plt.plot(df_dist[""horas""], y, marker=""o"")
+plt.title(f""Distancia ({PRIMARY_METRIC.upper()}) vs tamaño de ventana — modo={SMOOTH_MODE}"")
+plt.xlabel(""Tamaño de ventana (horas)"")
+plt.ylabel(PRIMARY_METRIC.upper())
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+png_path = OUT_DIR / f""distancia_{PRIMARY_METRIC}_{SMOOTH_MODE}.png""
+plt.savefig(png_path, dpi=300)
+plt.show()
+print(f""[OK] Gráfica guardada en: {png_path}"")"
+"# ==============================
+# Distancia entre series suavizadas (RMSE/MAE/L2_tiempo)
+# ==============================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# --------- CONFIGURACIÓN ---------
+# Rutas por defecto en tu PC (solo se usan si df_est/df_sen no existen ya)
+BASE_EST_DIR = Path(r""C:\Users\Usuario\Downloads\asignacion_1"")
+SENSORS_DIR  = BASE_EST_DIR / ""mediciones""
+
+# Carpeta de salida
+OUT_DIR = Path.home() / ""Taller_distancias"" / ""distancias""
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Ventanas (en horas)
+WINDOW_START = 2   # inicio
+WINDOW_END   = 120 # fin
+WINDOW_STEP  = 2   # paso (4h)
+WINDOWS = [f""{h}h"" for h in range(WINDOW_START, WINDOW_END + 1, WINDOW_STEP)]
+
+# Modo de suavizado:
+#  - ""loose"": rolling por ventana de tiempo (min_periods=1) -> bordes permisivos.
+#  - ""strict"": resample 1H y rolling por N muestras (min_periods=N) -> exige ventana completa.
+SMOOTH_MODE = ""loose""   # ""loose"" o ""strict""
+
+# Métrica principal a reportar en la gráfica (además se guardan las otras)
+PRIMARY_METRIC = ""rmse""  # ""rmse"", ""mae"" o ""l2_time""
+
+
+# --------- HELPERS GENERALES ---------
+def find_column_by_keywords(columns, keywords):
+    cols_l = [str(c).lower() for c in columns]
+    for kw in keywords:
+        for i, c in enumerate(cols_l):
+            if kw.lower() in c:
+                return columns[i]
+    return None
+
+def parse_datetime_series(srs):
+    """"""Convierte robustamente a datetime (serial Excel si mayormente numérico; si no, dayfirst/False).""""""
+    s = srs.copy()
+    s_nn = s.dropna()
+    n = len(s_nn)
+    if n == 0:
+        return pd.to_datetime(s, errors=""coerce"")
+
+    # ¿Mayormente numérico? -> serial Excel
+    numeric_count = sum(isinstance(x, (int, float, np.integer, np.floating)) for x in s_nn)
+    if n > 0 and numeric_count / n > 0.75:
+        parsed_excel = pd.to_datetime(s, unit='d', origin='1899-12-30', errors='coerce')
+        if parsed_excel.notna().sum() > 0:
+            return parsed_excel
+
+    d1 = pd.to_datetime(s, dayfirst=True, errors='coerce')
+    d2 = pd.to_datetime(s, dayfirst=False, errors='coerce')
+    return d1 if d1.notna().sum() >= d2.notna().sum() else d2
+
+def safe_numeric(srs):
+    return pd.to_numeric(srs, errors='coerce')
+
+def _prep_df(df, name):
+    """"""Asegura DateTimeIndex y columna 'pm25'.""""""
+    if ""pm25"" not in df.columns:
+        if len(df.columns) == 1:
+            df = df.rename(columns={df.columns[0]: ""pm25""})
+        else:
+            raise ValueError(f""{name} no tiene columna 'pm25'."")
+    idx = pd.to_datetime(df.index, errors=""coerce"")
+    out = df.copy()
+    out.index = idx
+    out = out.dropna(subset=[""pm25""]).sort_index()
+    return out
+
+def _exists_df(name, g):
+    return (name in g) and isinstance(g[name], pd.DataFrame)
+
+# --------- CARGA DE ESTACIONES/SENSORES (si no existen) ---------
+def load_estaciones_from_dir(base_dir: Path):
+    """"""Busca un Excel de estaciones en base_dir y devuelve DF indexado por tiempo con columna pm25.""""""
+    xlsx_files = list(base_dir.glob(""*.xlsx""))
+    if not xlsx_files:
+        return None
+    # Prioriza nombres con 'estacion' o 'amb'
+    prio = [p for p in xlsx_files if (""estacion"" in p.stem.lower() or ""amb"" in p.stem.lower())]
+    ref_file = prio[0] if prio else xlsx_files[0]
+
+    try:
+        df = pd.read_excel(ref_file, header=[0,1], engine=""openpyxl"")
+        # Aplana si MultiIndex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [""_"".join([str(x) for x in tup if str(x) != ""nan"" and str(x).strip() != """"]).strip() or ""unnamed""
+                          for tup in df.columns]
+    except Exception:
+        df = pd.read_excel(ref_file, header=0, engine=""openpyxl"")
+
+    # Detectar columnas
+    time_col = find_column_by_keywords(df.columns, ['date&time', 'date', 'time', 'fecha', 'hora']) or df.columns[0]
+    pm_col   = (find_column_by_keywords(df.columns, ['pm2.5', 'pm 2.5', 'pm25', 'pm'])
+                or (df.columns[1] if len(df.columns) > 1 else df.columns[0]))
+
+    t = parse_datetime_series(df[time_col])
+    v = safe_numeric(df[pm_col])
+    out = pd.DataFrame({""pm25"": v}, index=t).dropna().sort_index()
+    return out
+
+def load_sensores_from_dir(sensors_dir: Path):
+    """"""Concatena todos los CSV de sensors_dir, detectando columnas tiempo/pm y promediando duplicados.""""""
+    import glob
+    csv_files = sorted(glob.glob(str(sensors_dir / ""*.csv"")))
+    if not csv_files:
+        return None
+
+    frames = []
+    for path in csv_files:
+        try:
+            d = pd.read_csv(path)
+        except Exception:
+            try:
+                d = pd.read_csv(path, sep="";"", encoding=""latin-1"")
+            except Exception:
+                continue
+
+        d.columns = [str(c).strip() for c in d.columns]
+        tcol = find_column_by_keywords(d.columns, ['date&time', 'date', 'time', 'fecha', 'hora']) or d.columns[0]
+        pcol = (find_column_by_keywords(d.columns, ['pm2.5', 'pm 2.5', 'pm25', 'pm'])
+                or (d.columns[1] if len(d.columns) > 1 else d.columns[0]))
+        tmp = pd.DataFrame({
+            ""tiempo"": parse_datetime_series(d[tcol]),
+            ""pm25"": safe_numeric(d[pcol])
+        }).dropna().sort_values(""tiempo"")
+        frames.append(tmp)
+
+    if not frames:
+        return None
+
+    df = pd.concat(frames, ignore_index=True)
+    df = df.set_index(""tiempo"").sort_index()
+    # Si hay múltiples sensores en el mismo instante, promedia
+    df = df.groupby(df.index).mean()
+    return df
+
+# Si no existen df_est / df_sen, intenta cargarlos desde las rutas por defecto
+g = globals()
+if not _exists_df(""df_est"", g) or not _exists_df(""df_sen"", g):
+    _est = load_estaciones_from_dir(BASE_EST_DIR)
+    _sen = load_sensores_from_dir(SENSORS_DIR)
+    if _est is None or _sen is None:
+        raise RuntimeError(""No encuentro df_est/df_sen ni pude cargar desde las rutas por defecto. Ajusta BASE_EST_DIR y SENSORS_DIR."")
+    df_est, df_sen = _prep_df(_est, ""df_est""), _prep_df(_sen, ""df_sen"")
+else:
+    df_est, df_sen = _prep_df(df_est, ""df_est""), _prep_df(df_sen, ""df_sen"")
+
+print(""[EST] n:"", len(df_est), ""rango:"", df_est.index.min(), ""→"", df_est.index.max())
+print(""[SEN] n:"", len(df_sen), ""rango:"", df_sen.index.min(), ""→"", df_sen.index.max())
+
+# --------- ALINEACIÓN POR CERCANÍA ---------
+def _to_naive_utc_index(s: pd.Series) -> pd.Series:
+    s = s.dropna().copy()
+    idx = pd.to_datetime(s.index, errors=""coerce"")
+    if getattr(idx, ""tz"", None) is not None:
+        idx = idx.tz_convert(""UTC"").tz_localize(None)
+    s.index = idx
+    return s.sort_index()
+
+def _delta_tipico(s: pd.Series) -> pd.Timedelta:
+    idx = s.index
+    if len(idx) < 2:
+        return pd.Timedelta(0)
+    return pd.Series(idx).diff().median()
+
+def alinear_por_cercania(ref: pd.Series, sen: pd.Series, window_str: str) -> pd.DataFrame:
+    """"""Empareja por tiempo más cercano con tolerancia estricta.""""""
+    ref_n = _to_naive_utc_index(ref)
+    sen_n = _to_naive_utc_index(sen)
+    w = pd.to_timedelta(window_str)
+
+    d_ref, d_sen = _delta_tipico(ref_n), _delta_tipico(sen_n)
+    # Tolerancia más conservadora
+    if d_ref > pd.Timedelta(0) and d_sen > pd.Timedelta(0):
+        base = min(d_ref, d_sen)
+    else:
+        base = w / 8
+    tol = min(base * 0.5, w / 8)
+
+    A = ref_n.rename(""ref"").reset_index().rename(columns={""index"": ""fecha""})
+    B = sen_n.rename(""sen"").reset_index().rename(columns={""index"": ""fecha""})
+    A[""fecha""] = pd.to_datetime(A[""fecha""], utc=False)
+    B[""fecha""] = pd.to_datetime(B[""fecha""], utc=False)
+    df = pd.merge_asof(A.sort_values(""fecha""), B.sort_values(""fecha""),
+                       on=""fecha"", direction=""nearest"", tolerance=tol)
+    return df.dropna(subset=[""ref"", ""sen""]).set_index(""fecha"").sort_index()
+
+# --------- MÉTRICAS DE DISTANCIA ---------
+def distancia_metricas(df_al: pd.DataFrame, metric=""rmse""):
+    """"""RMSE/MAE/L2 sobre puntos emparejados (no ponderado).""""""
+    if df_al.empty:
+        return np.nan
+    d = (df_al[""ref""] - df_al[""sen""]).to_numpy()
+    if metric == ""rmse"":
+        return float(np.sqrt(np.mean(d**2)))
+    elif metric == ""mae"":
+        return float(np.mean(np.abs(d)))
+    elif metric == ""l2"":
+        return float(np.sqrt(np.sum(d**2)))
+    else:
+        raise ValueError(""metric debe ser 'rmse', 'mae' o 'l2'."")
+
+def distancia_l2_timeweighted(df_al: pd.DataFrame) -> float:
+    """"""Aproxima ||ref - sen||_L2 = sqrt(∫ (r-s)^2 dt) por trapecios en tiempo.""""""
+    if len(df_al) < 2:
+        return np.nan
+    d2 = (df_al[""ref""] - df_al[""sen""]).to_numpy()**2
+    t = df_al.index.view(""int64"") / 1e9  # segundos
+    dt = np.diff(t)
+    mid = 0.5 * (d2[:-1] + d2[1:])
+    integral = np.sum(mid * dt)  # (valor^2)*s
+    return float(np.sqrt(integral))
+
+# --------- SUAVIZADO (rolling) ---------
+def compute_ma(series, win_str, mode):
+    if mode == ""loose"":
+        win = pd.Timedelta(win_str)                  # acepta '6h', '12h', etc.
+        return series.rolling(win, min_periods=1).mean()
+    elif mode == ""strict"":
+        s_reg = series.resample(""1h"").mean()         # minúscula
+        N = int(pd.Timedelta(win_str) / pd.Timedelta(""1h""))
+        return s_reg.rolling(N, min_periods=N).mean()
+
+
+# --------- CÁLCULO DE DISTANCIAS ---------
+rows = []
+for w in WINDOWS:
+    est_ma = compute_ma(df_est[""pm25""], w, SMOOTH_MODE)
+    sen_ma = compute_ma(df_sen[""pm25""], w, SMOOTH_MODE)
+
+    df_al = alinear_por_cercania(est_ma, sen_ma, w)
+    pares = len(df_al)
+
+    D_rmse   = distancia_metricas(df_al, ""rmse"")
+    D_mae    = distancia_metricas(df_al, ""mae"")
+    D_l2     = distancia_metricas(df_al, ""l2"")
+    D_l2time = distancia_l2_timeweighted(df_al)
+
+    rows.append({
+        ""ventana"": w,
+        ""pares"": pares,
+        ""rmse"": D_rmse,
+        ""mae"": D_mae,
+        ""l2"": D_l2,
+        ""l2_time"": D_l2time
+    })
+
+df_dist = pd.DataFrame(rows)
+df_dist[""horas""] = df_dist[""ventana""].str.replace(""h"", """", case=False).astype(int)
+df_dist = df_dist.sort_values(""horas"").reset_index(drop=True)
+
+# --------- RESÚMENES ---------
+print(""\nResumen (primeras filas):"")
+print(df_dist.head(10).to_string(index=False))
+
+validas = df_dist[df_dist[""pares""] > 0].copy()
+
+def best_row(metric):
+    vv = validas.dropna(subset=[metric])
+    return vv.loc[vv[metric].idxmin()] if not vv.empty else None
+
+best_rmse   = best_row(""rmse"")
+best_mae    = best_row(""mae"")
+best_l2time = best_row(""l2_time"")
+
+if best_rmse is not None:
+    print(f""\n[MEJOR RMSE] ventana={best_rmse['ventana']} | horas={int(best_rmse['horas'])} ""
+          f""| pares={int(best_rmse['pares'])} | RMSE={best_rmse['rmse']:.6f}"")
+if best_mae is not None:
+    print(f""[MEJOR MAE ] ventana={best_mae['ventana']} | horas={int(best_mae['horas'])} ""
+          f""| pares={int(best_mae['pares'])} | MAE={best_mae['mae']:.6f}"")
+if best_l2time is not None:
+    print(f""[MEJOR L2_t] ventana={best_l2time['ventana']} | horas={int(best_l2time['horas'])} ""
+          f""| pares={int(best_l2time['pares'])} | L2_t={best_l2time['l2_time']:.6f}"")
+
+# --------- GUARDAR CSV ---------
+csv_path = OUT_DIR / f""distancias_{SMOOTH_MODE}_{WINDOW_START}-{WINDOW_END}h_step{WINDOW_STEP}.csv""
+df_dist.to_csv(csv_path, index=False)
+print(f""\n[OK] Resultados guardados en: {csv_path}"")
+
+# --------- GRÁFICA (métrica primaria) ---------
+y = df_dist[PRIMARY_METRIC]
+plt.figure(figsize=(9,5))
+plt.plot(df_dist[""horas""], y, marker=""o"")
+plt.title(f""RMSE vs tamaño de ventana "")
+plt.xlabel(""Tamaño de ventana (horas)"")
+plt.ylabel(PRIMARY_METRIC.upper())
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+png_path = OUT_DIR / f""distancia_{PRIMARY_METRIC}_{SMOOTH_MODE}.png""
+plt.savefig(png_path, dpi=300)
+plt.show()
+print(f""[OK] Gráfica guardada en: {png_path}"")"
+"import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ---------- utilidades mínimas (si ya las tienes, puedes omitirlas) ----------
+def compute_ma(series: pd.Series, win_str: str | None = ""24h"", mode: str = ""loose""):
+    """"""Promedio móvil: 'loose' (rolling por tiempo, bordes permisivos) o 'strict' (resample 1h + ventana completa).""""""
+    series = series.sort_index()
+    if win_str is None:
+        return series
+    if mode == ""loose"":
+        win = pd.Timedelta(win_str)            # evita warnings de 'H'
+        return series.rolling(win, min_periods=1).mean()
+    elif mode == ""strict"":
+        s_reg = series.resample(""1h"").mean()   # rejilla horaria
+        N = max(int(pd.Timedelta(win_str)/pd.Timedelta(""1h"")), 1)
+        return s_reg.rolling(N, min_periods=N).mean()
+    else:
+        raise ValueError(""mode debe ser 'loose' o 'strict'"")
+
+def alinear_por_cercania_flexible(ref: pd.Series, sen: pd.Series, window_str: str,
+                                  factors=(0.5, 1.0, 2.0, 4.0), min_tol=""5min""):
+    """"""Empareja ref-sen por tiempo con tolerancia creciente hasta lograr pares.""""""
+    def _to_naive_utc_index(s: pd.Series) -> pd.Series:
+        s = s.dropna().copy()
+        idx = pd.to_datetime(s.index, errors=""coerce"")
+        if getattr(idx, ""tz"", None) is not None:
+            idx = idx.tz_convert(""UTC"").tz_localize(None)
+        s.index = idx
+        return s.sort_index()
+    def _delta_tipico(s: pd.Series) -> pd.Timedelta:
+        idx = s.index
+        if len(idx) < 2: return pd.Timedelta(0)
+        return pd.Series(idx).diff().median()
+
+    ref_n = _to_naive_utc_index(ref)
+    sen_n = _to_naive_utc_index(sen)
+    w = pd.to_timedelta(window_str)
+    d_ref, d_sen = _delta_tipico(ref_n), _delta_tipico(sen_n)
+    base = (min(d_ref, d_sen) if (d_ref > pd.Timedelta(0) and d_sen > pd.Timedelta(0))
+            else pd.to_timedelta(min_tol))
+
+    A = ref_n.rename(""ref"").reset_index().rename(columns={""index"": ""fecha""})
+    B = sen_n.rename(""sen"").reset_index().rename(columns={""index"": ""fecha""})
+    A[""fecha""] = pd.to_datetime(A[""fecha""], utc=False)
+    B[""fecha""] = pd.to_datetime(B[""fecha""], utc=False)
+
+    for f in factors:
+        tol = min(base * f, w/4)  # no exceder una fracción de la ventana
+        df = pd.merge_asof(A.sort_values(""fecha""), B.sort_values(""fecha""),
+                           on=""fecha"", direction=""nearest"", tolerance=tol)
+        df = df.dropna(subset=[""ref"",""sen""]).set_index(""fecha"").sort_index()
+        if not df.empty:
+            print(f""[alinear] OK tolerancia={tol} (pares={len(df)})"")
+            return df
+        else:
+            print(f""[alinear] sin pares con tolerancia={tol}, probando mayor…"")
+    return pd.DataFrame(columns=[""ref"",""sen""])
+
+# ---------- función principal: grafica todo y marca fuera de tolerancia ----------
+def graficar_y_outliers(
+    win_str=""24h"",          # ventana de suavizado ('6h','12h','24h', None para sin suavizar)
+    mode=""loose"",           # 'loose' o 'strict'
+    abs_tol=5.0,            # tolerancia absoluta en µg/m³ (None para ignorar)
+    rel_tol=None,           # tolerancia relativa (p.ej. 0.2 = 20%; None para ignorar)
+    sigma_ref=None,         # incertidumbre de la referencia (escalares o arrays), en µg/m³
+    sigma_sen=None,         # incertidumbre del sensor (escalares o arrays), en µg/m³
+    k_sigma=2.0,            # multiplicador k·σ (p.ej. 2 sigma)
+    out_dir=None,           # carpeta de salida
+    mostrar_top=15          # imprime los primeros N outliers
+):
+    # --- checks básicos ---
+    if ""df_est"" not in globals() or ""df_sen"" not in globals():
+        raise RuntimeError(""Necesito df_est y df_sen en el entorno (Índice datetime, columna 'pm25')."")
+
+    # 1) Suavizar
+    est_ma = compute_ma(df_est[""pm25""], win_str, mode)
+    sen_ma = compute_ma(df_sen[""pm25""], win_str, mode)
+
+    # 2) Alinear por tiempo (flex)
+    w_align = win_str or ""1h""
+    df_al = alinear_por_cercania_flexible(est_ma, sen_ma, w_align)
+    if df_al.empty:
+        print(""[AVISO] No se lograron pares alineados."")
+        return
+
+    # 3) Errores y tolerancia
+    df_al = df_al.copy()
+    df_al[""error""] = df_al[""sen""] - df_al[""ref""]
+    df_al[""abs_error""] = df_al[""error""].abs()
+
+    # tolerancia por punto (tomamos el MÁXIMO entre aportes disponibles)
+    tol_arr = np.zeros(len(df_al), dtype=float)
+
+    # (a) absoluta
+    if abs_tol is not None:
+        tol_arr = np.maximum(tol_arr, float(abs_tol))
+
+    # (b) relativa (fracción de la referencia)
+    if rel_tol is not None:
+        tol_arr = np.maximum(tol_arr, float(rel_tol) * np.abs(df_al[""ref""].to_numpy()))
+
+    # (c) por incertidumbres (RSS): k * sqrt(σ_y^2 + σ_x^2)
+    if (sigma_ref is not None) or (sigma_sen is not None):
+        if np.isscalar(sigma_ref) or sigma_ref is None:
+            sx = np.full(len(df_al), 0.0 if sigma_ref is None else float(sigma_ref))
+        else:
+            sx = np.asarray(sigma_ref, float)
+            if sx.size != len(df_al):
+                sx = np.full(len(df_al), np.median(sx))  # fallback
+        if np.isscalar(sigma_sen) or sigma_sen is None:
+            sy = np.full(len(df_al), 0.0 if sigma_sen is None else float(sigma_sen))
+        else:
+            sy = np.asarray(sigma_sen, float)
+            if sy.size != len(df_al):
+                sy = np.full(len(df_al), np.median(sy))  # fallback
+
+        tol_sigma = float(k_sigma) * np.sqrt(sx**2 + sy**2)
+        tol_arr = np.maximum(tol_arr, tol_sigma)
+
+    df_al[""tol""] = tol_arr
+    df_al[""rel_error""] = df_al[""abs_error""] / np.maximum(np.abs(df_al[""ref""]), 1e-9)
+    df_al[""fuera_tol""] = df_al[""abs_error""] > df_al[""tol""]
+
+    n_tot = len(df_al)
+    n_out = int(df_al[""fuera_tol""].sum())
+    print(f""[RESUMEN] pares={n_tot} | fuera_tolerancia={n_out} ({n_out*100.0/n_tot:.2f}%)"")
+
+    # 4) Gráfica
+    plt.figure(figsize=(9,6))
+    # dentro de tolerancia
+    dentro = df_al[~df_al[""fuera_tol""]]
+    plt.scatter(dentro[""ref""], dentro[""sen""], s=7, alpha=0.25, label=f""En tolerancia (n={len(dentro)})"")
+    # fuera de tolerancia
+    fuera = df_al[df_al[""fuera_tol""]]
+    if not fuera.empty:
+        plt.scatter(fuera[""ref""], fuera[""sen""], s=18, alpha=0.9, label=f""Fuera de tolerancia (n={len(fuera)})"", color=""red"")
+
+    # y = x
+    x_min = float(np.nanmin(df_al[""ref""]))
+    x_max = float(np.nanmax(df_al[""ref""]))
+    xs = np.linspace(x_min, x_max, 200)
+    plt.plot(xs, xs, ""--"", lw=1, label=""y = x (ideal)"")
+
+    # banda de tolerancia si es CONSTANTE (misma tol para todos los puntos)
+    if np.isfinite(tol_arr).all() and np.ptp(tol_arr) < 1e-9 and tol_arr[0] > 0:
+        band = tol_arr[0]
+        plt.plot(xs, xs + band, "":"", lw=1, label=f""+{band:.2f} µg/m³"")
+        plt.plot(xs, xs - band, "":"", lw=1, label=f""-{band:.2f} µg/m³"")
+
+    # banda relativa (si está configurada y sin incertidumbres variables)
+    if (rel_tol is not None) and (sigma_ref is None) and (sigma_sen is None) and (abs_tol is None):
+        # y = (1 ± r) x
+        r = float(rel_tol)
+        plt.plot(xs, (1+r)*xs, "":"", lw=1, label=f""+{int(r*100)}%"")
+        plt.plot(xs, (1-r)*xs, "":"", lw=1, label=f""-{int(r*100)}%"")
+
+    titulo = ""Sensor vs Referencia — puntos y fuera de tolerancia""
+    if win_str: titulo += f"" — MA {win_str}""
+    plt.title(titulo)
+    plt.xlabel(""Medición (referencia)"")
+    plt.ylabel(""Sensor"")
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc=""best"")
+    plt.tight_layout()
+
+    # 5) Guardar
+    out_dir = Path.home() / ""Taller_distancias"" / ""outliers"" if out_dir is None else Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tag = f""MA_{win_str or 'sinMA'}""
+    png_path = out_dir / f""sensor_vs_ref_outliers_{tag}.png""
+    csv_path = out_dir / f""outliers_{tag}.csv""
+
+    plt.savefig(png_path, dpi=300)
+    try:
+        plt.show()
+    except Exception:
+        pass
+
+    # Guardar CSV solo con fuera de tolerancia (y también todo si quieres)
+    fuera_sorted = fuera.copy()
+    fuera_sorted = fuera_sorted.sort_index()
+    fuera_sorted.to_csv(csv_path, index=True)
+    print(f""[OK] PNG: {png_path}"")
+    print(f""[OK] CSV fuera de tolerancia: {csv_path}"")
+
+    # Mostrar una muestra por consola
+    if n_out > 0 and mostrar_top:
+        print(""\nEjemplos fuera de tolerancia:"")
+        print(fuera_sorted[[""ref"",""sen"",""error"",""abs_error"",""tol"",""rel_error""]].head(mostrar_top).to_string())"
+"# ===== Alcance (max - min) para promedios móviles 4h..120h (paso 4h), con alineación por cercanía =====
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+# --- 0) Normalización ligera de entrada ---
+def _prep_df(df, name):
+    if not isinstance(df, pd.DataFrame):
+        raise ValueError(f""{name} debe ser DataFrame."")
+    if ""pm25"" not in df.columns:
+        if len(df.columns) == 1:
+            df = df.rename(columns={df.columns[0]: ""pm25""})
+        else:
+            raise ValueError(f""{name} no tiene columna 'pm25'."")
+    idx = pd.to_datetime(df.index, errors=""coerce"")
+    df = df.copy()
+    df.index = idx
+    return df.dropna(subset=[""pm25""]).sort_index()
+
+df_est = _prep_df(df_est, ""df_est"")   # referencia (estación)
+df_sen = _prep_df(df_sen, ""df_sen"")   # sensor
+
+print(""[EST] n:"", len(df_est), ""rango:"", df_est.index.min(), ""→"", df_est.index.max())
+print(""[SEN] n:"", len(df_sen), ""rango:"", df_sen.index.min(), ""→"", df_sen.index.max())
+
+# --- 1) Helpers de tiempo y alineación (idéntico criterio que para 'D') ---
+def _to_naive_utc_index(s: pd.Series) -> pd.Series:
+    s = s.dropna().copy()
+    idx = pd.to_datetime(s.index, errors=""coerce"")
+    if getattr(idx, ""tz"", None) is not None:
+        idx = idx.tz_convert(""UTC"").tz_localize(None)
+    s.index = idx
+    return s.sort_index()
+
+def _delta_tipico(s: pd.Series) -> pd.Timedelta:
+    idx = s.index
+    if len(idx) < 2: return pd.Timedelta(0)
+    return pd.Series(idx).diff().median()
+
+def alinear_por_cercania(ref: pd.Series, sen: pd.Series, window_str: str) -> pd.DataFrame:
+    """"""
+    Empareja ref y sen por tiempo más cercano con tolerancia:
+    tol = min(max(delta_ref, delta_sen), window/4).
+    Devuelve DataFrame con columnas ['ref','sen'] e índice temporal común.
+    """"""
+    ref_n = _to_naive_utc_index(ref)
+    sen_n = _to_naive_utc_index(sen)
+
+    w = pd.to_timedelta(window_str)
+    d_ref, d_sen = _delta_tipico(ref_n), _delta_tipico(sen_n)
+    tol = max(d_ref, d_sen)
+    if tol == pd.Timedelta(0): tol = w/4
+    tol = min(tol, w/4)
+
+    A = ref_n.rename(""ref"").reset_index().rename(columns={""index"":""fecha""})
+    B = sen_n.rename(""sen"").reset_index().rename(columns={""index"":""fecha""})
+    A[""fecha""] = pd.to_datetime(A[""fecha""], utc=False)
+    B[""fecha""] = pd.to_datetime(B[""fecha""], utc=False)
+
+    df = pd.merge_asof(A.sort_values(""fecha""), B.sort_values(""fecha""),
+                       on=""fecha"", direction=""nearest"", tolerance=tol)
+    return df.dropna(subset=[""ref"",""sen""]).set_index(""fecha"").sort_index()
+
+# --- 2) Alcance por ventana (sobre el intervalo común alineado) ---
+def alcance_intervalo_comun(ref_ma: pd.Series, sen_ma: pd.Series, win_str: str):
+    df_al = alinear_por_cercania(ref_ma, sen_ma, win_str)
+    if df_al.empty:
+        return np.nan, np.nan, 0
+    a_ref = float(df_al[""ref""].max() - df_al[""ref""].min())
+    a_sen = float(df_al[""sen""].max() - df_al[""sen""].min())
+    return a_ref, a_sen, len(df_al)
+
+# --- 3) Barrido de ventanas 4h..120h (paso 4h) ---
+windows = [f""{h}h"" for h in range(4, 121, 4)]
+rows = []
+for w in windows:
+    off = w.upper()  # '4H'...'120H'
+    est_ma = df_est[""pm25""].rolling(off, min_periods=1).mean()
+    sen_ma = df_sen[""pm25""].rolling(off, min_periods=1).mean()
+    a_ref, a_sen, n = alcance_intervalo_comun(est_ma, sen_ma, off)
+    rows.append({""ventana"": w, ""horas"": int(w[:-1]), ""pares"": n,
+                 ""alcance_ref"": a_ref, ""alcance_sen"": a_sen})
+
+df_alc = pd.DataFrame(rows).sort_values(""horas"").reset_index(drop=True)
+
+# --- 4) Mostrar todo (sin truncar) con 2 decimales ---
+pd.set_option(""display.max_rows"", None)
+df_show = df_alc.copy()
+df_show[""alcance_ref""] = df_show[""alcance_ref""].round(2)
+df_show[""alcance_sen""] = df_show[""alcance_sen""].round(2)
+print(""\nAlcance (max - min) por ventana, sobre intervalo común:"")
+print(df_show[[""horas"",""pares"",""alcance_ref"",""alcance_sen""]].to_string(index=False))
+
+# --- 5) (Opcional) Guardar CSV
+out_dir = Path.home() / ""Taller_distancias"" / ""salidas_alcances""
+out_dir.mkdir(parents=True, exist_ok=True)
+df_alc.to_csv(out_dir / ""alcances_4h_a_120h.csv"", index=False)
+print(f""\n[OK] CSV guardado en: {out_dir/'alcances_4h_a_120h.csv'}"")"
+"# ============================================
+# PM2.5 — MA (cada 30 min hasta 48 h) + Ajuste E=λS
+# Entrada interactiva de ventana (0.5 en 0.5) + Bandas paralelas ±10%
+# ============================================
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ---------- Configuración ----------
+file_estaciones = r""C:\Users\Usuario\Downloads\taller mediciones\Datos_Estaciones_AMB.xlsx""
+file_sensores   = r""C:\Users\Usuario\Downloads\taller mediciones\Sensor.xlsx""
+
+out_dir = Path.home() / ""Taller_distancias"" / ""moviles_pm25""
+out_dir.mkdir(parents=True, exist_ok=True)
+
+pareo_tol = pd.Timedelta(""60min"")     # tolerancia temporal para merge_asof
+mostrar_serie_tiempo = False
+
+# ============================================
+# 1) CARGA Y LIMPIEZA
+# ============================================
+# --- Estaciones ---
+df_est = pd.read_excel(file_estaciones)
+df_est = df_est.rename(columns={""Date&Time"": ""fecha"", ""PM2.5"": ""pm25""})
+df_est = df_est.iloc[1:, :]  # quitar fila de unidades
+df_est = df_est[df_est[""pm25""] != ""NoData""][[""fecha"", ""pm25""]].copy()
+df_est[""fecha""] = pd.to_datetime(df_est[""fecha""], errors=""coerce"")
+df_est[""pm25""]  = pd.to_numeric(df_est[""pm25""], errors=""coerce"")
+df_est = df_est.dropna().sort_values(""fecha"").set_index(""fecha"")
+
+# --- Sensores ---
+df_sen = pd.read_excel(file_sensores)
+df_sen = df_sen.rename(columns={""time"": ""fecha"", ""pm25"": ""pm25""})[[""fecha"", ""pm25""]].copy()
+df_sen[""fecha""] = pd.to_datetime(df_sen[""fecha""], errors=""coerce"")
+df_sen[""pm25""]  = pd.to_numeric(df_sen[""pm25""], errors=""coerce"")
+df_sen = df_sen.dropna().sort_values(""fecha"").set_index(""fecha"")
+
+print(""[EST] puntos:"", len(df_est), ""rango:"", df_est.index.min(), ""→"", df_est.index.max())
+print(""[SEN] puntos:"", len(df_sen), ""rango:"", df_sen.index.min(), ""→"", df_sen.index.max())
+
+# ============================================
+# 2) HELPERS
+# ============================================
+def _to_timedelta(w) -> pd.Timedelta:
+    """"""'2h', '90min', '1h30m' o Timedelta -> Timedelta.""""""
+    if isinstance(w, pd.Timedelta):
+        return w
+    s = str(w).strip().lower().replace("" "", """")
+    s = s.replace(""mins"", ""min"").replace(""mns"", ""min"").replace(""hr"", ""h"")
+    if s.endswith(""m"") and not s.endswith(""min""):
+        s = s[:-1] + ""min""
+    return pd.to_timedelta(s)
+
+def fmt_td(td: pd.Timedelta) -> str:
+    """"""Etiqueta limpia para archivos/leyendas: '1h30m', '24h00m'.""""""
+    total_min = int(td.total_seconds() // 60)
+    h, m = divmod(total_min, 60)
+    return f""{h}h{m:02d}m""
+
+# ============================================
+# 3) PROMEDIOS MÓVILES (SOLO 30 min → 48 h) + CSVs
+# ============================================
+# 0.5 h, 1.0 h, …, 48.0 h  => 96 ventanas
+_windows_td  = [pd.Timedelta(minutes=30*i) for i in range(1, 96+1)]
+_windows_lbl = [fmt_td(td) for td in _windows_td]
+
+ma_results = {}  # {label: (est_ma, sen_ma)}
+for td, label in zip(_windows_td, _windows_lbl):
+    est_ma = df_est[""pm25""].rolling(td, min_periods=1).mean()
+    sen_ma = df_sen[""pm25""].rolling(td, min_periods=1).mean()
+    ma_results[label] = (est_ma, sen_ma)
+
+    # CSVs de cada MA
+    (out_dir / f""estaciones_MA_{label}.csv"").write_text(
+        est_ma.rename(f""estaciones_PM25_MA_{label}"").to_frame().to_csv(index=True),
+        encoding=""utf-8""
+    )
+    (out_dir / f""sensores_MA_{label}.csv"").write_text(
+        sen_ma.rename(f""sensores_PM25_MA_{label}"").to_frame().to_csv(index=True),
+        encoding=""utf-8""
+    )
+
+print(""Ventanas 30min→48h (ejemplos):"", _windows_lbl[:6], ""… total:"", len(_windows_lbl))
+
+# ============================================
+# 4) INPUT: ventana (horas, múltiplos de 0.5)
+# ============================================
+def pedir_ventana_usuario(min_h=0.5, max_h=48.0, paso=0.5) -> tuple[pd.Timedelta, str]:
+    while True:
+        s = input(f""Ventana en horas (múltiplos de {paso}, entre {min_h} y {max_h}): "").strip()
+        s = s.replace("","", ""."")  # permitir 1,5
+        try:
+            h = float(s)
+        except ValueError:
+            print(""✖ Entrada no numérica. Intenta de nuevo."")
+            continue
+        if not (min_h <= h <= max_h):
+            print(f""✖ Fuera de rango [{min_h}, {max_h}]. Intenta de nuevo."")
+            continue
+        if abs(h / paso - round(h / paso)) > 1e-9:
+            print(f""✖ Debe ser múltiplo de {paso}. Ej: 0.5, 1.0, 1.5, …"")
+            continue
+        td = pd.Timedelta(hours=h)
+        label = fmt_td(td)
+        print(f""✔ Ventana seleccionada: {label}"")
+        return td, label
+
+td_sel, label_sel = pedir_ventana_usuario()
+
+# Obtener o construir la MA elegida
+pair = ma_results.get(label_sel)
+if pair is None:
+    est_ma = df_est[""pm25""].rolling(td_sel, min_periods=1).mean()
+    sen_ma = df_sen[""pm25""].rolling(td_sel, min_periods=1).mean()
+else:
+    est_ma, sen_ma = pair
+
+# ============================================
+# 5) AJUSTE E = λ·S (merge_asof y métricas)
+# ============================================
+# Normalizar índices (timezone-naive)
+for s in (est_ma, sen_ma):
+    try: s.index = s.index.tz_convert(None)
+    except Exception: pass
+    try: s.index = s.index.tz_localize(None)
+    except Exception: pass
+
+est_df = est_ma.dropna().rename(""E"").to_frame().reset_index()
+est_df = est_df.rename(columns={est_df.columns[0]: ""t""}).sort_values(""t"")
+sen_df = sen_ma.dropna().rename(""S"").to_frame().reset_index()
+sen_df = sen_df.rename(columns={sen_df.columns[0]: ""t""}).sort_values(""t"")
+
+df_pair = pd.merge_asof(est_df, sen_df, on=""t"", direction=""nearest"", tolerance=pareo_tol).dropna()
+if df_pair.empty:
+    print(""[Aviso] merge_asof sin pares. Intentando resampleo a 1H…"")
+    est_r = est_ma.resample(""1H"").mean()
+    sen_r = sen_ma.resample(""1H"").mean()
+    df_pair = pd.concat({""E"": est_r, ""S"": sen_r}, axis=1).dropna().reset_index()
+    df_pair = df_pair.rename(columns={df_pair.columns[0]: ""t""})
+if df_pair.empty:
+    raise RuntimeError(f""No hay pares E,S para {label_sel} incluso tras resampleo."")
+
+# Mínimos cuadrados E = λ·S
+s = df_pair[""S""].values.astype(float)
+e = df_pair[""E""].values.astype(float)
+den = float(np.dot(s, s))
+lam = np.nan if den == 0 else float(np.dot(s, e) / den)
+yhat = lam * s
+res  = e - yhat
+rmse = float(np.sqrt(np.mean(res**2)))
+mae  = float(np.mean(np.abs(res)))
+
+print(f""[Ajuste] MA={label_sel}  λ={lam:.6g}  RMSE={rmse:.3f}  MAE={mae:.3f}"")
+
+# ============================================
+# 6) BANDAS PARALELAS ±10% (del rango vertical de la recta en [Smin,Smax])
+# ============================================
+s_line = np.linspace(s.min(), s.max(), 200)
+e_line = lam * s_line
+y_span = e_line.max() - e_line.min()
+offset = 0.10 * y_span                 # 10%
+
+upper = e_line + offset
+lower = e_line - offset
+
+dentro = np.abs(res) <= offset
+fuera  = ~dentro
+print(f""[Paralelas ±10%] dentro={int(dentro.sum())}/{len(res)}  fuera={int(fuera.sum())}/{len(res)}  offset={offset:.3f}"")
+
+# ============================================
+# 7) GRÁFICA DISPERSIÓN + LÍNEA + PARALELAS
+# ============================================
+plt.figure(figsize=(8,6))
+plt.scatter(s[dentro], e[dentro], s=9, label=""Dentro ±10%"", alpha=0.8)
+plt.scatter(s[fuera],  e[fuera],  s=7, label=""Fuera ±10%"",  alpha=0.9)
+plt.plot(s_line, e_line, lw=2, c=""red"",   label=f""Ajuste E = λ·S (λ={lam:.3f})"")
+plt.plot(s_line, upper,  lw=1, c=""green"", linestyle=""--"", label=""+10% (paralela)"")
+plt.plot(s_line, lower,  lw=1, c=""green"", linestyle=""--"", label=""-10% (paralela)"")
+plt.title(f""E (estación) vs S (sensor) — MA {label_sel} — Bandas paralelas ±10%"")
+plt.xlabel(""Sensor S [µg/m³]""); plt.ylabel(""Estación E [µg/m³]"")
+plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+
+out_png = out_dir / f""ajuste_dispersion_{label_sel}_paralelas10.png""
+plt.savefig(out_png, dpi=150)
+print(f""[OK] guardado: {out_png}"")
+plt.show()
+
+# (Opcional) Serie temporal E vs Ê
+if mostrar_serie_tiempo:
+    df_plot = df_pair.copy()
+    df_plot[""E_hat""]  = yhat
+    df_plot[""dentro""] = dentro
+    plt.figure(figsize=(12,5))
+    plt.plot(df_plot[""t""], df_plot[""E""], marker=""o"", ms=2, linestyle=""none"", label=""E (estación)"")
+    plt.plot(df_plot[""t""], df_plot[""E_hat""], lw=1.2, label=""Ê = λ·S"")
+    if df_plot[""dentro""].sum() < len(df_plot):
+        idx_out = df_plot.loc[~df_plot[""dentro""], ""t""]
+        plt.scatter(idx_out, df_plot.loc[~df_plot[""dentro""], ""E""], s=14, label=""Fuera ±10%"", alpha=0.9)
+    plt.title(f""Serie temporal (MA {label_sel}) — λ={lam:.3f}"")
+    plt.xlabel(""Fecha""); plt.ylabel(""PM2.5 [µg/m³]"")
+    plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+    out_time = out_dir / f""ajuste_serie_{label_sel}_paralelas10.png""
+    plt.savefig(out_time, dpi=150)
+    print(f""[OK] guardado: {out_time}"")
+    plt.show()"
+"# Regenerar un archivo Excel **mínimo y robusto** solo con la lista de ventanas
+# cada 30 minutos hasta 48 horas (sin NaNs ni caracteres especiales)
+# usando el motor 'xlsxwriter' para máxima compatibilidad.
+import pandas as pd
+
+minutes = list(range(30, 48*60 + 1, 30))  # 30, 60, ..., 2880
+ventanas = pd.DataFrame({
+    ""ventana_min"": minutes,
+    ""ventana_horas"": [m/60 for m in minutes],
+    ""freq_pandas"": [f""{m}min"" for m in minutes],
+})
+
+xlsx_path = ""/mnt/data/ventanas_30min_48h.xlsx""
+csv_path  = ""/mnt/data/ventanas_30min_48h.csv""
+
+with pd.ExcelWriter(xlsx_path, engine=""xlsxwriter"") as writer:
+    ventanas.to_excel(writer, sheet_name=""ventanas"", index=False)
+
+# También genero un CSV como alternativa por si el Excel sigue presentando problemas de descarga/compatibilidad.
+ventanas.to_csv(csv_path, index=False)
+
+xlsx_path, csv_path"
+"# =========================
+# EXPORTADOR GENERAL A CSV
+# (Pégalo al final de tu código)
+# =========================
+import os, sys, types, datetime
+from collections.abc import Mapping, Sequence
+
+try:
+    import pandas as pd
+except Exception as e:
+    raise RuntimeError(""Este bloque requiere pandas instalado (pip install pandas)."") from e
+
+# Carpeta de salida (puedes cambiarla si quieres)
+OUTPUT_DIR = os.path.join(os.getcwd(), ""csv_export"")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def _sanitize(name: str) -> str:
+    """"""Nombre seguro para archivo.""""""
+    invalid = '<>:""/\\|?*'
+    for ch in invalid:
+        name = name.replace(ch, ""_"")
+    name = name.strip().replace("" "", ""_"")
+    if not name:
+        name = ""objeto""
+    return name[:90]
+
+def _to_dataframe(obj, var_name=""obj""):
+    """"""Convierte Series/ndarray/estructuras simples a DataFrame cuando sea posible.""""""
+    import numpy as np
+    # DataFrame
+    if isinstance(obj, pd.DataFrame):
+        df = obj.copy()
+    # Series -> DataFrame
+    elif isinstance(obj, pd.Series):
+        # Si el índice parece tiempo, lo llevamos a columna 'tiempo'
+        idx_name = obj.index.name or ""index""
+        df = obj.to_frame(name=_sanitize(var_name))
+        df.reset_index(inplace=True)
+        if isinstance(df[idx_name], (pd.DatetimeIndex, pd.Series)) and pd.api.types.is_datetime64_any_dtype(df[idx_name]):
+            df.rename(columns={idx_name: ""tiempo""}, inplace=True)
+    # Numpy arrays (1D/2D)
+    elif hasattr(obj, ""__class__"") and obj.__class__.__name__ == ""ndarray"":
+        arr = obj
+        if arr.ndim == 1:
+            df = pd.DataFrame({ _sanitize(var_name): arr })
+        elif arr.ndim == 2:
+            cols = [f""c{i}"" for i in range(arr.shape[1])]
+            df = pd.DataFrame(arr, columns=cols)
+        else:
+            return None
+    # Secuencias simples (lista/tupla) con tipos primitivos
+    elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
+        # Si es una lista de dicts -> DataFrame
+        if len(obj) > 0 and all(isinstance(x, Mapping) for x in obj):
+            df = pd.DataFrame(obj)
+        # Si es una lista de valores -> DataFrame de una columna
+        elif len(obj) > 0 and all(not isinstance(x, (Mapping, Sequence)) or isinstance(x, (str, bytes, bytearray)) for x in obj):
+            df = pd.DataFrame({ _sanitize(var_name): list(obj) })
+        else:
+            return None
+    else:
+        return None
+
+    # Index datetime -> a columna
+    if df.index.name is not None or not isinstance(df.index, pd.RangeIndex):
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index().rename(columns={""index"": ""tiempo""})
+        else:
+            df = df.reset_index().rename(columns={""index"": ""index""})
+    # Limpieza de dtypes fecha
+    for c in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[c]):
+            df[c] = df[c].dt.tz_localize(None)
+    return df
+
+def _iter_exportables(namespace: dict):
+    """"""Itera sobre variables exportables en el espacio de nombres.""""""
+    # Orden alfabético para nombres estables
+    for name in sorted(namespace.keys()):
+        if name.startswith(""_""):
+            continue
+        obj = namespace[name]
+        # saltar módulos, funciones y clases
+        if isinstance(obj, types.ModuleType) or isinstance(obj, types.FunctionType) or isinstance(obj, type):
+            continue
+        yield name, obj
+
+def _export_dict_like(d: Mapping, base_name: str, counter_start: int, manifest: list):
+    """"""Exporta valores DataFrame/Series dentro de un dict.""""""
+    k = counter_start
+    for key in sorted(d.keys(), key=lambda x: str(x)):
+        sub = d[key]
+        df = _to_dataframe(sub, f""{base_name}_{key}"")
+        if df is None:
+            continue
+        fname = f""{k:02d}_{_sanitize(base_name)}__{_sanitize(str(key))}.csv""
+        fpath = os.path.join(OUTPUT_DIR, fname)
+        df.to_csv(fpath, index=False, encoding=""utf-8-sig"")
+        manifest.append({
+            ""archivo"": fname,
+            ""variable"": f""{base_name}[{key!r}]"",
+            ""filas"": len(df),
+            ""columnas"": len(df.columns),
+            ""columnas_nombres"": "","".join(map(str, df.columns)),
+        })
+        k += 1
+    return k
+
+def _export_seq_like(seq: Sequence, base_name: str, counter_start: int, manifest: list):
+    """"""Exporta valores DataFrame/Series dentro de una lista/tupla.""""""
+    k = counter_start
+    for i, sub in enumerate(seq):
+        df = _to_dataframe(sub, f""{base_name}_{i}"")
+        if df is None:
+            continue
+        fname = f""{k:02d}_{_sanitize(base_name)}__{i:03d}.csv""
+        fpath = os.path.join(OUTPUT_DIR, fname)
+        df.to_csv(fpath, index=False, encoding=""utf-8-sig"")
+        manifest.append({
+            ""archivo"": fname,
+            ""variable"": f""{base_name}[{i}]"",
+            ""filas"": len(df),
+            ""columnas"": len(df.columns),
+            ""columnas_nombres"": "","".join(map(str, df.columns)),
+        })
+        k += 1
+    return k
+
+def exportar_todo_a_csv(namespace: dict = None):
+    """"""
+    Busca en el espacio de nombres objetos exportables (DataFrame/Series, listas/dicts de esos),
+    los guarda como CSV con prefijos ordenados y genera MANIFEST.csv.
+    """"""
+    if namespace is None:
+        namespace = globals()
+
+    manifest = []
+    counter = 1
+
+    # 1) Exporta variables sueltas (DataFrame/Series/convertibles)
+    for name, obj in _iter_exportables(namespace):
+        df_directa = _to_dataframe(obj, name)
+        if df_directa is not None:
+            fname = f""{counter:02d}_{_sanitize(name)}.csv""
+            fpath = os.path.join(OUTPUT_DIR, fname)
+            df_directa.to_csv(fpath, index=False, encoding=""utf-8-sig"")
+            manifest.append({
+                ""archivo"": fname,
+                ""variable"": name,
+                ""filas"": len(df_directa),
+                ""columnas"": len(df_directa.columns),
+                ""columnas_nombres"": "","".join(map(str, df_directa.columns)),
+            })
+            counter += 1
+            continue
+
+        # 2) Si es dict -> exporta sus elementos exportables
+        if isinstance(obj, Mapping):
+            counter = _export_dict_like(obj, name, counter, manifest)
+            continue
+
+        # 3) Si es lista/tupla -> exporta sus elementos exportables
+        if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
+            counter = _export_seq_like(obj, name, counter, manifest)
+            continue
+
+    # Genera MANIFEST.csv con resumen
+    ts = datetime.datetime.now().strftime(""%Y-%m-%d %H:%M:%S"")
+    man_df = pd.DataFrame(manifest)
+    man_df.insert(0, ""timestamp_export"", ts)
+    man_path = os.path.join(OUTPUT_DIR, ""MANIFEST.csv"")
+    man_df.to_csv(man_path, index=False, encoding=""utf-8-sig"")
+
+    print(f""[OK] Exportación completada. Archivos en: {OUTPUT_DIR}"")
+    if len(manifest) == 0:
+        print(""Aviso: no se detectaron objetos exportables. ""
+              ""Asegúrate de que existan DataFrames/Series o listas/dicts de estos."")
+    else:
+        print(f""Total CSV generados (sin contar el MANIFEST): {len(manifest)}"")
+        # Muestra los primeros 10 para referencia
+        for fila in manifest[:10]:
+            print("" -"", fila[""archivo""], ""|"", fila[""variable""], f""({fila['filas']}x{fila['columnas']})"")
+
+# Ejecuta la exportación
+exportar_todo_a_csv()"
